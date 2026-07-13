@@ -147,6 +147,13 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+#Ignore this file
+avgzsl_benchmark_datasets
+runs
+run_scripts
+cls_feature_extration
+selavi_feature_extraction
+
 # Environments
 .env
 .envrc
