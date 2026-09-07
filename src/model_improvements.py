@@ -83,6 +83,124 @@ class Transformer(nn.Module):
         # functional.reset_net(self.layers)
         return x
 
+
+class CrossModalResidualGate(nn.Module):
+    """Add sample-adaptive complementary information without erasing either modality.
+
+    Cross-modal attention is useful when the modalities agree, but a direct
+    fused representation can also amplify the modality-specific shortcut that
+    causes the Seen bias in GZSL.  This block therefore predicts a bounded,
+    feature-wise residual from the other modality and adds it to the original
+    representation.  The source modality remains the identity path, while the
+    gate can suppress contradictory complementary evidence per sample.
+    """
+
+    def __init__(self, dim: int, dropout: float = 0.1,
+                 residual_scale: float = 0.2):
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("Cross-modal residual dimension must be positive")
+        if residual_scale < 0:
+            raise ValueError("Cross-modal residual scale must be non-negative")
+        self.residual_scale = float(residual_scale)
+        self.audio_from_video = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.video_from_audio = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.audio_gate = nn.Sequential(
+            nn.LayerNorm(dim * 2), nn.Linear(dim * 2, dim), nn.Sigmoid())
+        self.video_gate = nn.Sequential(
+            nn.LayerNorm(dim * 2), nn.Linear(dim * 2, dim), nn.Sigmoid())
+
+    def forward(self, audio: torch.Tensor, video: torch.Tensor):
+        if audio.ndim != 2 or video.ndim != 2 or audio.shape != video.shape:
+            raise ValueError(
+                "Cross-modal residual expects audio/video tensors with the "
+                f"same (B, D) shape, got {tuple(audio.shape)} and "
+                f"{tuple(video.shape)}")
+        audio_video = torch.cat((audio, video), dim=-1)
+        video_audio = torch.cat((video, audio), dim=-1)
+        audio_residual = F.layer_norm(
+            self.audio_from_video(video), (audio.shape[-1],))
+        video_residual = F.layer_norm(
+            self.video_from_audio(audio), (video.shape[-1],))
+        audio_gate = self.audio_gate(audio_video)
+        video_gate = self.video_gate(video_audio)
+        return (
+            audio + self.residual_scale * audio_gate * audio_residual,
+            video + self.residual_scale * video_gate * video_residual,
+        )
+
+
+class _GradientReverse(torch.autograd.Function):
+    """Identity in the forward pass and a sign flip during backpropagation."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, scale):
+        ctx.scale = float(scale)
+        return input_tensor.view_as(input_tensor)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.scale * grad_output, None
+
+
+def gradient_reverse(input_tensor, scale=1.0):
+    return _GradientReverse.apply(input_tensor, scale)
+
+
+class VisualSemanticResidualDebiaser(nn.Module):
+    """Split a fused visual feature into semantic and context-residual codes.
+
+    This is a feature-level adaptation of semantic/residual decomposition for
+    GZSL. It does not claim to recover raw-frame motion: the semantic code is
+    supervised by the existing text objective, while the residual is retained
+    only for reconstruction and adversarially discouraged from predicting text.
+    """
+
+    def __init__(self, dim, output_dim, dropout=0.1):
+        super().__init__()
+        if dim <= 0 or output_dim <= 0:
+            raise ValueError("Debiaser dimensions must be positive")
+
+        def encoder():
+            return nn.Sequential(
+                nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(dim, dim))
+
+        self.semantic_encoder = encoder()
+        self.residual_encoder = encoder()
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(dim * 2), nn.Linear(dim * 2, dim), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(dim, dim))
+        # This probe learns to recover text-compatible labels from the
+        # residual, while gradient reversal makes the residual encoder remove
+        # that information instead of hiding semantic shortcuts there.
+        self.residual_text_probe = nn.Sequential(
+            nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(),
+            nn.Linear(dim, output_dim))
+
+    def forward(self, visual_feature):
+        if visual_feature.ndim != 2:
+            raise ValueError(
+                "VisualSemanticResidualDebiaser expects a (B, D) tensor, got "
+                f"{tuple(visual_feature.shape)}")
+        semantic = self.semantic_encoder(visual_feature)
+        residual = self.residual_encoder(visual_feature)
+        reconstruction = self.decoder(torch.cat((semantic, residual), dim=-1))
+        residual_text = self.residual_text_probe(gradient_reverse(residual))
+        return semantic, residual, reconstruction, residual_text
+
 class TRL(nn.Module):
     """Tensor Regression Layer (Tucker-decomposition based linear regression).
 
@@ -245,25 +363,94 @@ class TRL(nn.Module):
         return penalty
 
 
+class StableVectorTRL(nn.Module):
+    """Stable low-rank TRL for already flattened modality features.
+
+    The singleton spatial modes in the original four-factor TRL do not add
+    expressive power: the contraction is a low-rank linear map.  Removing
+    those modes avoids multiplying gradients through two extra tiny factors.
+    """
+
+    def __init__(self, input_size, output_size, rank):
+        super().__init__()
+        rank = min(int(rank), int(input_size), int(output_size))
+        if rank <= 0:
+            raise ValueError(f"StableVectorTRL rank must be positive, got {rank}")
+        self.input_factor = nn.Linear(input_size, rank, bias=False)
+        self.output_factor = nn.Linear(rank, output_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(output_size))
+        nn.init.orthogonal_(self.input_factor.weight)
+        nn.init.xavier_uniform_(self.output_factor.weight)
+
+    def forward(self, x):
+        if x.ndim != 2:
+            raise ValueError(
+                "StableVectorTRL expected flattened features shaped (B, D), "
+                f"got {tuple(x.shape)}")
+        return self.output_factor(self.input_factor(x)) + self.bias
+
+
+class SpatialReliabilityGate(nn.Module):
+    """Estimate a bounded spatial-branch weight from two agreement statistics."""
+
+    def __init__(self, initial_gate=0.25):
+        super().__init__()
+        if not 0.0 < initial_gate < 1.0:
+            raise ValueError("initial_gate must be strictly between zero and one")
+        self.projection = nn.Linear(2, 1)
+        nn.init.zeros_(self.projection.weight)
+        initial_logit = math.log(initial_gate / (1.0 - initial_gate))
+        nn.init.constant_(self.projection.bias, initial_logit)
+
+    def forward(self, semantic, spatial):
+        if semantic.ndim != 2 or spatial.shape != semantic.shape:
+            raise ValueError(
+                "Spatial reliability expects aligned (B, D) semantic and "
+                f"spatial features, got {tuple(semantic.shape)} and "
+                f"{tuple(spatial.shape)}")
+        cosine = F.cosine_similarity(semantic, spatial, dim=1, eps=1e-6)
+        norm_ratio = torch.log(
+            (spatial.norm(dim=1) + 1e-6) /
+            (semantic.norm(dim=1) + 1e-6)).clamp(-5.0, 5.0)
+        statistics = torch.stack((cosine, norm_ratio), dim=1)
+        return torch.sigmoid(self.projection(statistics))
+
+
 
 
 class EmbeddingNet(nn.Module):
-    def __init__(self, input_size, output_size, dropout, use_bn, momentum,hidden_size=None):
+    def __init__(self, input_size, output_size, dropout, use_bn, momentum,
+                 hidden_size=None, normalization="batchnorm"):
         super(EmbeddingNet, self).__init__()
+        if normalization not in {"batchnorm", "layernorm"}:
+            raise ValueError(
+                "normalization must be 'batchnorm' or 'layernorm', got "
+                f"{normalization!r}")
+
+        def normalization_layer(features, batchnorm_momentum=None):
+            if normalization == "layernorm":
+                return nn.LayerNorm(features)
+            if batchnorm_momentum is None:
+                return nn.BatchNorm1d(num_features=features)
+            return nn.BatchNorm1d(
+                num_features=features, momentum=batchnorm_momentum)
+
         modules = []
         if hidden_size:
             modules.append(nn.Linear(in_features=input_size, out_features=hidden_size))
             if use_bn:
-                modules.append(nn.BatchNorm1d(num_features=hidden_size))
+                modules.append(normalization_layer(hidden_size))
             modules.append(nn.ReLU())
             modules.append(nn.Dropout(dropout))
             modules.append(nn.Linear(in_features=hidden_size, out_features=output_size))
-            modules.append(nn.BatchNorm1d(num_features=output_size, momentum=momentum))
+            modules.append(normalization_layer(output_size, momentum))
             modules.append(nn.ReLU())
             modules.append(nn.Dropout(dropout))
         else:
             modules.append(nn.Linear(in_features=input_size, out_features=output_size))
-            modules.append(nn.BatchNorm1d(num_features=output_size))
+            # Preserve the historical one-layer EmbeddingNet behavior: its
+            # output normalization was present even when ``use_bn`` was false.
+            modules.append(normalization_layer(output_size))
             modules.append(nn.ReLU())
             modules.append(nn.Dropout(dropout))
         self.fc = nn.Sequential(*modules)
@@ -274,6 +461,41 @@ class EmbeddingNet(nn.Module):
 
     def get_embedding(self, x):
         return self.forward(x)
+
+
+class RunningFeatureStandardizer(nn.Module):
+    """Per-feature Z-score with batch updates and frozen inference statistics."""
+
+    def __init__(self, feature_dim, momentum=0.1, eps=1e-5):
+        super().__init__()
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+        self.register_buffer("running_mean", torch.zeros(feature_dim))
+        self.register_buffer("running_var", torch.ones(feature_dim))
+        self.register_buffer(
+            "num_batches_tracked", torch.tensor(0, dtype=torch.long))
+
+    def forward_group(self, *embeddings):
+        if not embeddings:
+            raise ValueError("At least one embedding tensor is required")
+        joined = torch.cat(embeddings, dim=0)
+        if self.training:
+            mean = joined.mean(dim=0)
+            variance = joined.var(dim=0, unbiased=False)
+            with torch.no_grad():
+                if self.num_batches_tracked.item() == 0:
+                    self.running_mean.copy_(mean.detach())
+                    self.running_var.copy_(variance.detach())
+                else:
+                    self.running_mean.lerp_(mean.detach(), self.momentum)
+                    self.running_var.lerp_(variance.detach(), self.momentum)
+                self.num_batches_tracked.add_(1)
+        else:
+            mean = self.running_mean
+            variance = self.running_var
+        inverse_std = torch.rsqrt(variance.clamp_min(0.0) + self.eps)
+        return tuple((embedding - mean) * inverse_std
+                     for embedding in embeddings)
 
 class SigmoidSpike(torch.autograd.Function):
     """Straight-through surrogate gradient for the LIF hard spike.
@@ -432,7 +654,11 @@ class GlobalLocalPool(nn.Module):
 
     def forward(self, I: torch.Tensor, return_context: bool = False):
         # I: (B, D). Pool over the feature dim -> per-sample scalars (B, 1).
-        p_max = I.max(dim=-1, keepdim=True).values
+        # `Tensor.max(...).values` also saves a CUDA argmax index tensor for
+        # backward. In torch 2.0.1+cu118 this path eventually trips an internal
+        # CUDAGuard assertion in the long GLP + BPTT run on Ada GPUs. `amax`
+        # computes the same forward value without the unused argmax output.
+        p_max = torch.amax(I, dim=-1, keepdim=True)
         p_avg = I.mean(dim=-1, keepdim=True)
         p_all = 0.5 * (p_max + p_avg) + self.beta * p_max + (1.0 - self.beta) * p_avg
         # Eq. 7 applies a residual GLP modulation before the spiking neuron.
@@ -457,8 +683,14 @@ class STFTSNNBranch(nn.Module):
     """
 
     def __init__(self, input_size, output_size, hidden_size,
-                 tau: float = 2.0, v_threshold: float = 1.0, momentum: float = 0.1):
+                 tau: float = 2.0, v_threshold: float = 1.0,
+                 momentum: float = 0.1, use_glp: bool = True,
+                 membrane_readout_scale: float = 0.0):
         super().__init__()
+        self.use_glp = bool(use_glp)
+        self.membrane_readout_scale = float(membrane_readout_scale)
+        if self.membrane_readout_scale < 0.0:
+            raise ValueError("membrane_readout_scale must be non-negative")
         self.fc1 = nn.Linear(input_size, hidden_size)
         # Normalization before each LIF so the input current has enough dynamic
         # range to actually cross the firing threshold. Without it the Linear
@@ -489,14 +721,41 @@ class STFTSNNBranch(nn.Module):
         self.ln3 = nn.LayerNorm(output_size)
         self.lif3 = LIFNeuron(tau=tau, v_threshold=v_threshold)
         self.glp3 = GlobalLocalPool()
+        # Preserve the original checkpoint surface for the spike-only path.
+        # The learned gate is present only in the explicit membrane-readout
+        # ablation, where it bounds the continuous residual by the configured
+        # maximum scale.
+        self.membrane_readout_gate = (
+            nn.Parameter(torch.tensor(0.0))
+            if self.membrane_readout_scale > 0.0 else None)
 
     def reset(self):
         self.lif1.reset()
         self.lif2.reset()
         self.lif3.reset()
 
-    def set_threshold(self, v_threshold: float):
-        """Set all neurons' shared runtime threshold for the DTH hook."""
+    def set_threshold(self, v_threshold):
+        """Set the DTH threshold without coupling independent batch samples.
+
+        The LIF comparison broadcasts a ``(B, 1)`` threshold over feature
+        dimensions. Keeping that tensor as transient runtime state lets DTH
+        adapt each sample independently; a batch-mean scalar made a sample's
+        embedding change when unrelated samples were added to its batch.
+        """
+        if torch.is_tensor(v_threshold):
+            value = v_threshold.detach()
+            if value.ndim == 1:
+                value = value.unsqueeze(-1)
+            if value.ndim != 2 or value.shape[1] != 1:
+                raise ValueError(
+                    "Per-sample DTH thresholds must have shape (B, 1), got "
+                    f"{tuple(value.shape)}")
+            if not torch.isfinite(value).all():
+                raise ValueError("Per-sample DTH thresholds must be finite")
+            for lif in (self.lif1, self.lif2, self.lif3):
+                lif.threshold_value = value
+            return
+
         value = float(v_threshold)
         for lif in (self.lif1, self.lif2, self.lif3):
             lif.threshold_value = value
@@ -506,18 +765,29 @@ class STFTSNNBranch(nn.Module):
         # One LIF step. The GLP gates the input current before each neuron.
         I1 = self.fc1(x)
         I1 = self.ln1(I1)
-        I1 = self.glp1(I1)
+        if self.use_glp:
+            I1 = self.glp1(I1)
         s1 = self.lif1(I1)
         I2 = self.fc2(s1)
         I2 = self.ln2(I2)
-        I2 = self.glp2(I2)
+        if self.use_glp:
+            I2 = self.glp2(I2)
         s2 = self.lif2(I2)
         I3 = self.fc3(s2)
         I3 = self.ln3(I3)
-        I3, p_all = self.glp3(I3, return_context=True)
+        if self.use_glp:
+            I3, p_all = self.glp3(I3, return_context=True)
+        else:
+            p_all = I3.new_zeros(I3.shape[0], 1)
         out = self.lif3(I3)
         self._last_p_all = p_all.detach()
-        return out
+        self._last_spike_output = out
+        if self.membrane_readout_gate is None:
+            return out
+        membrane = F.layer_norm(self.lif3.v, (self.lif3.v.shape[-1],))
+        residual_scale = self.membrane_readout_scale * torch.sigmoid(
+            self.membrane_readout_gate)
+        return out + residual_scale * membrane
 
 
 class LatentKnowledgeCombiner(nn.Module):
@@ -659,7 +929,8 @@ class TemporalSemanticTuckerFusion(nn.Module):
         mixed = torch.einsum('bi,bj,ijk->bk', r, s, G)
         return out_proj(self.dropout(mixed))
 
-    def forward(self, R_a, S_a, R_v, S_v, P_a, P_v):
+    def forward(self, R_a, S_a, R_v, S_v, P_a, P_v,
+                spatial_reliability=None):
         """Fuse temporal, semantic and spatial features, then mix modalities.
 
         R_a, R_v: LKC-refined semantic features (B, D)
@@ -677,8 +948,22 @@ class TemporalSemanticTuckerFusion(nn.Module):
             (Y_v + self.spatial_pos[0], P_v + self.spatial_pos[1]), dim=1)
         spatial_tokens = self.spatial_fusion(
             torch.cat((audio_tokens, video_tokens), dim=0))
-        Y_a = spatial_tokens[:batch_size, 0, :]
-        Y_v = spatial_tokens[batch_size:, 0, :]
+        spatial_a = spatial_tokens[:batch_size, 0, :]
+        spatial_v = spatial_tokens[batch_size:, 0, :]
+        if spatial_reliability is None:
+            Y_a, Y_v = spatial_a, spatial_v
+        else:
+            gate_a, gate_v = spatial_reliability
+            expected = (batch_size, 1)
+            if tuple(gate_a.shape) != expected or tuple(gate_v.shape) != expected:
+                raise ValueError(
+                    "Spatial reliability gates must have shape "
+                    f"{expected}, got {tuple(gate_a.shape)} and "
+                    f"{tuple(gate_v.shape)}")
+            # Gate the net spatial-fusion contribution. Zero bypasses the
+            # branch, while one exactly recovers the ungated VectorTRL path.
+            Y_a = Y_a + gate_a * (spatial_a - Y_a)
+            Y_v = Y_v + gate_v * (spatial_v - Y_v)
 
         # Joint reasoning with shared-weight cross-attention (Eq. 14).
         seq = torch.stack((Y_a, Y_v), dim=1)        # (B, 2, D)
@@ -697,6 +982,9 @@ class MSTR(nn.Module):
         self.hidden_size_encoder=params_model['encoder_hidden_size']
         self.hidden_size_decoder=params_model['decoder_hidden_size']
         self.semantic_dim = params_model.get('stft_dim', 512)
+        self.text_embedding_size = int(params_model.get('text_embedding_size', 300))
+        if self.text_embedding_size <= 0:
+            raise ValueError("text_embedding_size must be positive")
         self.r_enc=params_model['dropout_encoder']#0.2 0.3
         self.r_proj=params_model['dropout_decoder']#0.3 0.1
         self.depth_transformer=params_model['depth_transformer']
@@ -707,6 +995,195 @@ class MSTR(nn.Module):
 
         self.first_additional_triplet=params_model['first_additional_triplet']
         self.second_additional_triplet=params_model['second_additional_triplet']
+        self.use_glp = bool(params_model.get('use_glp', True))
+        self.use_lkc = bool(params_model.get('use_lkc', True))
+        self.snn_activity_floor_weight = float(
+            params_model.get('snn_activity_floor_weight', 0.0))
+        self.snn_min_spike_rate = float(
+            params_model.get('snn_min_spike_rate', 0.05))
+        self.snn_membrane_readout_scale = float(
+            params_model.get('snn_membrane_readout_scale', 0.0))
+        if self.snn_activity_floor_weight < 0.0:
+            raise ValueError("snn_activity_floor_weight must be non-negative")
+        if not 0.0 < self.snn_min_spike_rate < 1.0:
+            raise ValueError("snn_min_spike_rate must be strictly between 0 and 1")
+        if self.snn_membrane_readout_scale < 0.0:
+            raise ValueError("snn_membrane_readout_scale must be non-negative")
+        # Experimental-only switch for paired ablations against the historical
+        # batch-shared DTH implementation. The default remains per-sample.
+        self.legacy_batch_dth = bool(
+            params_model.get('legacy_batch_dth', False))
+        self.ahse_standardize = bool(
+            params_model.get('ahse_standardize', False))
+        self.semantic_geometry_weight = float(
+            params_model.get('semantic_geometry_weight', 0.0))
+        if self.semantic_geometry_weight < 0.0:
+            raise ValueError("semantic_geometry_weight must be non-negative")
+        self.semantic_contrastive_weight = float(
+            params_model.get('semantic_contrastive_weight', 0.0))
+        self.semantic_contrastive_temperature = float(
+            params_model.get('semantic_contrastive_temperature', 0.1))
+        if self.semantic_contrastive_weight < 0.0:
+            raise ValueError("semantic_contrastive_weight must be non-negative")
+        if self.semantic_contrastive_temperature <= 0.0:
+            raise ValueError(
+                "semantic_contrastive_temperature must be positive")
+        self.pseudo_unseen_weight = float(
+            params_model.get('pseudo_unseen_weight', 0.0))
+        self.pseudo_unseen_temperature = float(
+            params_model.get('pseudo_unseen_temperature', 0.15))
+        self.pseudo_unseen_class_fraction = float(
+            params_model.get('pseudo_unseen_class_fraction', 0.5))
+        self.pseudo_unseen_min_classes = int(
+            params_model.get('pseudo_unseen_min_classes', 2))
+        if self.pseudo_unseen_weight < 0.0:
+            raise ValueError("pseudo_unseen_weight must be non-negative")
+        if self.pseudo_unseen_temperature <= 0.0:
+            raise ValueError("pseudo_unseen_temperature must be positive")
+        if not 0.0 < self.pseudo_unseen_class_fraction < 1.0:
+            raise ValueError("pseudo_unseen_class_fraction must be in (0, 1)")
+        if self.pseudo_unseen_min_classes < 2:
+            raise ValueError("pseudo_unseen_min_classes must be at least 2")
+        self.snn_temporal_consistency_weight = float(
+            params_model.get('snn_temporal_consistency_weight', 0.0))
+        self.snn_temporal_view_fraction = float(
+            params_model.get('snn_temporal_view_fraction', 0.25))
+        if self.snn_temporal_consistency_weight < 0.0:
+            raise ValueError(
+                "snn_temporal_consistency_weight must be non-negative")
+        if not 0.0 < self.snn_temporal_view_fraction <= 1.0:
+            raise ValueError(
+                "snn_temporal_view_fraction must be in (0, 1]")
+        self.temporal_quality_alignment_weight = float(
+            params_model.get('temporal_quality_alignment_weight', 0.0))
+        if self.temporal_quality_alignment_weight < 0.0:
+            raise ValueError(
+                "temporal_quality_alignment_weight must be non-negative")
+        self.cross_modal_contrastive_weight = float(
+            params_model.get('cross_modal_contrastive_weight', 0.0))
+        self.cross_modal_contrastive_temperature = float(
+            params_model.get('cross_modal_contrastive_temperature', 0.1))
+        if self.cross_modal_contrastive_weight < 0.0:
+            raise ValueError("cross_modal_contrastive_weight must be non-negative")
+        if self.cross_modal_contrastive_temperature <= 0.0:
+            raise ValueError(
+                "cross_modal_contrastive_temperature must be positive")
+        self.avla_contrastive_only = bool(
+            params_model.get('avla_contrastive_only', False))
+        self.avla_temperature = float(params_model.get('avla_temperature', 0.1))
+        if self.avla_temperature <= 0.0:
+            raise ValueError("avla_temperature must be positive")
+        self.global_prototype_contrastive_weight = float(
+            params_model.get('global_prototype_contrastive_weight', 0.0))
+        self.global_prototype_contrastive_temperature = float(
+            params_model.get('global_prototype_contrastive_temperature', 0.1))
+        if self.global_prototype_contrastive_weight < 0.0:
+            raise ValueError(
+                "global_prototype_contrastive_weight must be non-negative")
+        if self.global_prototype_contrastive_temperature <= 0.0:
+            raise ValueError(
+                "global_prototype_contrastive_temperature must be positive")
+        if self.global_prototype_contrastive_weight > 0.0 and self.ahse_standardize:
+            raise ValueError(
+                "global prototype contrastive loss is incompatible with "
+                "--ahse_standardize")
+        self.semantic_hard_negative_weight = float(
+            params_model.get('semantic_hard_negative_weight', 0.0))
+        self.semantic_hard_negative_margin = float(
+            params_model.get('semantic_hard_negative_margin', 0.1))
+        if self.semantic_hard_negative_weight < 0.0:
+            raise ValueError("semantic_hard_negative_weight must be non-negative")
+        if self.semantic_hard_negative_margin < 0.0:
+            raise ValueError("semantic_hard_negative_margin must be non-negative")
+        self.semantic_batch_hard_weight = float(
+            params_model.get('semantic_batch_hard_weight', 0.0))
+        self.semantic_batch_hard_margin = float(
+            params_model.get('semantic_batch_hard_margin', 0.1))
+        self.semantic_batch_hard_neighbors = int(
+            params_model.get('semantic_batch_hard_neighbors', 5))
+        if self.semantic_batch_hard_weight < 0.0:
+            raise ValueError("semantic_batch_hard_weight must be non-negative")
+        if self.semantic_batch_hard_margin < 0.0:
+            raise ValueError("semantic_batch_hard_margin must be non-negative")
+        if self.semantic_batch_hard_neighbors <= 0:
+            raise ValueError("semantic_batch_hard_neighbors must be positive")
+        self.semantic_neighbor_rank_weight = float(
+            params_model.get('semantic_neighbor_rank_weight', 0.0))
+        self.semantic_neighbor_rank_margin = float(
+            params_model.get('semantic_neighbor_rank_margin', 0.05))
+        self.semantic_neighbor_rank_neighbors = int(
+            params_model.get('semantic_neighbor_rank_neighbors', 5))
+        if self.semantic_neighbor_rank_weight < 0.0:
+            raise ValueError("semantic_neighbor_rank_weight must be non-negative")
+        if self.semantic_neighbor_rank_margin < 0.0:
+            raise ValueError("semantic_neighbor_rank_margin must be non-negative")
+        if self.semantic_neighbor_rank_neighbors <= 0:
+            raise ValueError("semantic_neighbor_rank_neighbors must be positive")
+        self.semantic_mixup_weight = float(
+            params_model.get('semantic_mixup_weight', 0.0))
+        self.semantic_mixup_alpha = float(
+            params_model.get('semantic_mixup_alpha', 1.0))
+        if self.semantic_mixup_weight < 0.0:
+            raise ValueError("semantic_mixup_weight must be non-negative")
+        if self.semantic_mixup_alpha <= 0.0:
+            raise ValueError("semantic_mixup_alpha must be positive")
+        self.feature_mixup_weight = float(
+            params_model.get('feature_mixup_weight', 0.0))
+        self.feature_mixup_alpha = float(
+            params_model.get('feature_mixup_alpha', 0.2))
+        if self.feature_mixup_weight < 0.0:
+            raise ValueError("feature_mixup_weight must be non-negative")
+        if self.feature_mixup_alpha <= 0.0:
+            raise ValueError("feature_mixup_alpha must be positive")
+        self.feature_debias_weight = float(
+            params_model.get('feature_debias_weight', 0.0))
+        self.feature_debias_temperature = float(
+            params_model.get('feature_debias_temperature', 0.1))
+        if self.feature_debias_weight < 0.0:
+            raise ValueError("feature_debias_weight must be non-negative")
+        if self.feature_debias_temperature <= 0.0:
+            raise ValueError("feature_debias_temperature must be positive")
+        self.text_projection_norm = params_model.get(
+            'text_projection_norm', 'batchnorm')
+        self.use_stft_vector_trl = bool(
+            params_model.get('stft_vector_trl', False))
+        self.use_stft_spatial_reliability_gate = bool(
+            params_model.get('stft_spatial_reliability_gate', False))
+        if (self.use_stft_spatial_reliability_gate and
+                not self.use_stft_vector_trl):
+            raise ValueError(
+                "stft_spatial_reliability_gate requires stft_vector_trl")
+        self.lkc_residual_scale = float(params_model.get('lkc_residual_scale', 0.2))
+        if self.lkc_residual_scale < 0.0:
+            raise ValueError("lkc_residual_scale must be non-negative")
+        self.use_cross_modal_residual = bool(
+            params_model.get('cross_modal_residual', False))
+        self.cross_modal_residual_scale = float(
+            params_model.get('cross_modal_residual_scale', 0.2))
+        if self.cross_modal_residual_scale < 0.0:
+            raise ValueError("cross_modal_residual_scale must be non-negative")
+        self.batch_labels = None
+        self._feature_debias_state = None
+        self._feature_mixup_inputs = None
+        self._positive_snn_rates = None
+        self._snn_temporal_view = None
+        self._snn_temporal_teachers = None
+        self._temporal_quality_features = None
+        self._spatial_reliability_state = None
+        self._snn_runtime_diagnostics = {}
+        # Populated only for the opt-in training loss. Non-persistent buffers
+        # preserve strict compatibility with all existing checkpoints.
+        self.register_buffer(
+            "_global_text_prototypes", torch.empty(0, self.text_embedding_size), persistent=False)
+        self.register_buffer(
+            "_global_prototype_class_ids", torch.empty(0, dtype=torch.long),
+            persistent=False)
+        self.register_buffer(
+            "_pseudo_unseen_text_prototypes", torch.empty(0, self.text_embedding_size),
+            persistent=False)
+        self.register_buffer(
+            "_pseudo_unseen_class_ids", torch.empty(0, dtype=torch.long),
+            persistent=False)
 
         print('Initializing trainable models...', end='')
 
@@ -727,33 +1204,39 @@ class MSTR(nn.Module):
             use_bn=True
         )
 
-        # Restore MSTR Eq. 4-7 spatial extraction. The original source encoded
-        # batch size 256 in these tuples and reshaped every batch to it. TRL
-        # treats the leading dimension as a placeholder, so rank 400 is kept
-        # for 512-D SeLaVi inputs while runtime batch size remains dynamic.
-        configured_trl_rank = params_model.get('trl_rank', 400)
-        audio_trl_rank = min(configured_trl_rank, input_size_audio)
-        video_trl_rank = min(configured_trl_rank, input_size_video)
-        self.trl_a = TRL(
-            ranks=(audio_trl_rank, 1, 1, self.semantic_dim),
-            input_size=(1, input_size_audio, 1, 1),
-            output_size=(1, self.semantic_dim))
-        self.trl_v = TRL(
-            ranks=(video_trl_rank, 1, 1, self.semantic_dim),
-            input_size=(1, input_size_video, 1, 1),
-            output_size=(1, self.semantic_dim))
+        if self.use_stft_vector_trl:
+            vector_rank = params_model.get('vector_trl_rank', 64)
+            self.trl_a = StableVectorTRL(
+                input_size_audio, self.semantic_dim, vector_rank)
+            self.trl_v = StableVectorTRL(
+                input_size_video, self.semantic_dim, vector_rank)
+        else:
+            # Original MSTR Eq. 4-7 spatial extraction. Keeping this exact
+            # construction by default preserves all baseline checkpoints.
+            configured_trl_rank = params_model.get('trl_rank', 400)
+            audio_trl_rank = min(configured_trl_rank, input_size_audio)
+            video_trl_rank = min(configured_trl_rank, input_size_video)
+            self.trl_a = TRL(
+                ranks=(audio_trl_rank, 1, 1, self.semantic_dim),
+                input_size=(1, input_size_audio, 1, 1),
+                output_size=(1, self.semantic_dim))
+            self.trl_v = TRL(
+                ranks=(video_trl_rank, 1, 1, self.semantic_dim),
+                input_size=(1, input_size_video, 1, 1),
+                output_size=(1, self.semantic_dim))
 
         self.W_proj= EmbeddingNet(
-            input_size=300,
+            input_size=self.text_embedding_size,
             output_size=self.dim_out,
             dropout=self.r_dec,
             momentum=self.momentum,
-            use_bn=True
+            use_bn=True,
+            normalization=self.text_projection_norm,
         )
 
         self.D = EmbeddingNet(
             input_size=self.dim_out,
-            output_size=300,
+            output_size=self.text_embedding_size,
             dropout=self.r_dec,
             momentum=self.momentum,
             use_bn=True
@@ -770,12 +1253,16 @@ class MSTR(nn.Module):
             input_size=input_size_audio,
             hidden_size=self.hidden_size_encoder,
             output_size=self.semantic_dim,
-            tau=snn_tau, v_threshold=1.0, momentum=self.momentum)
+            tau=snn_tau, v_threshold=1.0, momentum=self.momentum,
+            use_glp=self.use_glp,
+            membrane_readout_scale=self.snn_membrane_readout_scale)
         self.SNNbranchvideo = STFTSNNBranch(
             input_size=input_size_video,
             hidden_size=self.hidden_size_encoder,
             output_size=self.semantic_dim,
-            tau=snn_tau, v_threshold=1.0, momentum=self.momentum)
+            tau=snn_tau, v_threshold=1.0, momentum=self.momentum,
+            use_glp=self.use_glp,
+            membrane_readout_scale=self.snn_membrane_readout_scale)
         # Time-Step Factor: learns a per-step scalar weight for the TSF softmax.
         # Initialised so that softmax is near-uniform (all logits == 0).
         # NB: self.T is defined later (a few lines below); define it first.
@@ -801,6 +1288,23 @@ class MSTR(nn.Module):
         tucker_rank = params_model.get('tucker_rank', 60)
         self.tucker_fusion = TemporalSemanticTuckerFusion(
             dim=self.semantic_dim, rank=tucker_rank, dropout=self.r_enc)
+        self.spatial_reliability_gate = (
+            SpatialReliabilityGate(initial_gate=0.25)
+            if self.use_stft_spatial_reliability_gate else None)
+        # Optional feature-only context debiaser. It sits after SNN/Tucker
+        # fusion, so it neither removes nor substitutes the existing SNN path.
+        self.feature_debiaser = (
+            VisualSemanticResidualDebiaser(
+                self.semantic_dim, self.dim_out, dropout=self.r_enc)
+            if self.feature_debias_weight > 0.0 else None)
+        # Optional S-CMRL-inspired residual path. It is instantiated only for
+        # the explicit ablation so legacy checkpoints retain an identical
+        # state-dict and can still be loaded strictly.
+        self.cross_modal_residual = (
+            CrossModalResidualGate(
+                self.semantic_dim, dropout=self.r_enc,
+                residual_scale=self.cross_modal_residual_scale)
+            if self.use_cross_modal_residual else None)
 
         self.A_proj = EmbeddingNet(input_size=self.semantic_dim, hidden_size=self.hidden_size_decoder, output_size=self.dim_out, dropout=self.r_proj, momentum=self.momentum,use_bn=True)
 
@@ -810,18 +1314,36 @@ class MSTR(nn.Module):
 
         self.V_rec = EmbeddingNet(input_size=self.dim_out, output_size=self.semantic_dim, dropout=self.r_dec, momentum=self.momentum, use_bn=True)
 
+        if self.ahse_standardize:
+            # MSTR evaluates audio and video separately, so both branches use
+            # one audio-visual distribution while text keeps its own, as in
+            # AHSE Stage I's modality-wise standardization.
+            self.av_standardizer = RunningFeatureStandardizer(
+                self.dim_out, momentum=self.momentum)
+            self.text_standardizer = RunningFeatureStandardizer(
+                self.dim_out, momentum=self.momentum)
+
         # Optimizers
         print('Defining optimizers...', end='')
         self.lr = params_model['lr']
-        self.optimizer_gen = optim.Adam(list(self.A_proj.parameters()) + list(self.V_proj.parameters()) +
-                                        list(self.A_rec.parameters()) + list(self.V_rec.parameters()) +
-                                        list(self.V_enc.parameters()) + list(self.A_enc.parameters()) +
-                                        list(self.D.parameters()) +
-                                        list(self.W_proj.parameters())+list(self.SNNbranchaudio.parameters())+list(self.SNNbranchvideo.parameters())
-                                        +list(self.lkc.parameters())+list(self.tucker_fusion.parameters())
-                                        +list(self.trl_a.parameters())+list(self.trl_v.parameters())
-                                        +[self.tsf_logits],
-                                        lr=self.lr, weight_decay=1e-5, foreach=False)
+        trainable_params = (
+            list(self.A_proj.parameters()) + list(self.V_proj.parameters()) +
+            list(self.A_rec.parameters()) + list(self.V_rec.parameters()) +
+            list(self.V_enc.parameters()) + list(self.A_enc.parameters()) +
+            list(self.D.parameters()) + list(self.W_proj.parameters()) +
+            list(self.SNNbranchaudio.parameters()) +
+            list(self.SNNbranchvideo.parameters()) + list(self.lkc.parameters()) +
+            list(self.tucker_fusion.parameters()) + list(self.trl_a.parameters()) +
+            list(self.trl_v.parameters()) + [self.tsf_logits]
+        )
+        if self.cross_modal_residual is not None:
+            trainable_params += list(self.cross_modal_residual.parameters())
+        if self.feature_debiaser is not None:
+            trainable_params += list(self.feature_debiaser.parameters())
+        if self.spatial_reliability_gate is not None:
+            trainable_params += list(self.spatial_reliability_gate.parameters())
+        self.optimizer_gen = optim.Adam(
+            trainable_params, lr=self.lr, weight_decay=1e-5, foreach=False)
 
         self.scheduler_gen =  optim.lr_scheduler.ReduceLROnPlateau(self.optimizer_gen, 'max', patience=3, verbose=True)
 
@@ -861,17 +1383,28 @@ class MSTR(nn.Module):
         # prevents validation results from depending on data-loader order.
         snn_branch.reset()
         outs = []
+        spikes = []
         try:
             for _ in range(self.T):
                 out = snn_branch(x)
                 glp_p_all = getattr(snn_branch, '_last_p_all', None)
                 if glp_p_all is not None:
-                    self._dynamic_threshold(snn_branch, out, glp_p_all)
+                    self._dynamic_threshold(
+                        snn_branch, snn_branch._last_spike_output, glp_p_all)
                 outs.append(out)
+                spikes.append(snn_branch._last_spike_output)
             outs = torch.stack(outs, dim=1)  # (B, T, D)
+            spikes = torch.stack(spikes, dim=1)
 
             fused, weights = self._time_step_fusion(outs)
             snn_branch._last_tsf_weights = weights.detach()
+            snn_branch._last_spike_rate = spikes.detach().mean()
+            snn_branch._last_spike_rate_for_loss = spikes.mean()
+            threshold = snn_branch.lif3.threshold_value
+            snn_branch._last_dth_threshold = (
+                threshold.detach().float().mean()
+                if torch.is_tensor(threshold)
+                else outs.new_tensor(float(threshold)))
             return fused
         finally:
             # Outputs retain the bounded T-step autograd graph; the module must
@@ -911,7 +1444,10 @@ class MSTR(nn.Module):
         A binary spike vector is better modelled by Bernoulli entropy than by
         a softmax over feature positions. Sparse/constant outputs lower the
         threshold; information-rich spike patterns raise it. The update is
-        smoothed and clamped because a scalar threshold is shared by the batch.
+        smoothed and clamped per sample, then broadcast over its feature
+        dimension. It must not pool unrelated samples into one threshold.
+        ``legacy_batch_dth`` is retained only for paired reproducibility
+        experiments; it restores the historical batch-mean scalar update.
         """
         spike_rate = out.float().mean(dim=-1, keepdim=True).clamp(1e-6, 1.0 - 1e-6)
         entropy = -(spike_rate * torch.log(spike_rate) +
@@ -919,7 +1455,15 @@ class MSTR(nn.Module):
         pool_information = torch.sigmoid(glp_p_all)
         target = (0.5 * pool_information + entropy).clamp(0.25, 2.0)
         previous = snn_branch.lif3.threshold_value
-        new_th = 0.5 * previous + 0.5 * target.mean().item()
+        if self.legacy_batch_dth:
+            if torch.is_tensor(previous):
+                previous = previous.mean().item()
+            new_th = 0.5 * float(previous) + 0.5 * target.mean().item()
+            snn_branch.set_threshold(new_th)
+            return
+        if torch.is_tensor(previous):
+            previous = previous.to(device=target.device, dtype=target.dtype)
+        new_th = 0.5 * previous + 0.5 * target
         snn_branch.set_threshold(new_th)
 
     def _encode_temporal_audio(self, audio):
@@ -932,6 +1476,9 @@ class MSTR(nn.Module):
         and the SNN temporal feature, both (B, semantic_dim)."""
         phi_a = self.A_enc(audio)
         S_a = self._run_snn(self.SNNbranchaudio, audio)
+        # Normalize spike activity before Tucker fusion so a modality with a
+        # higher firing rate cannot overwhelm the semantic encoder.
+        S_a = F.layer_norm(S_a, (self.semantic_dim,))
         return phi_a, S_a
 
     def _encode_temporal_video(self, video):
@@ -939,6 +1486,7 @@ class MSTR(nn.Module):
         See :meth:`_encode_temporal_audio`."""
         phi_v = self.V_enc(video)
         S_v = self._run_snn(self.SNNbranchvideo, video)
+        S_v = F.layer_norm(S_v, (self.semantic_dim,))
         return phi_v, S_v
 
     @staticmethod
@@ -952,11 +1500,24 @@ class MSTR(nn.Module):
 
     def _encode_spatial(self, audio, video):
         """Encode MSTR spatial features with the audio/video TRL branches."""
+        if self.use_stft_vector_trl:
+            return self.trl_a(audio), self.trl_v(video)
         P_a = self.trl_a(self._as_spatial_tensor(audio))
         P_v = self.trl_v(self._as_spatial_tensor(video))
         return P_a, P_v
 
-    def _fuse_and_project(self, phi_a, phi_v, S_a, S_v, P_a, P_v):
+    def _apply_lkc_residual(self, phi_a, phi_v):
+        """Apply LKC as a normalized, learnably gated residual."""
+        if not self.use_lkc:
+            return phi_a, phi_v
+        refined_a, refined_v = self.lkc(phi_a, phi_v)
+        gate = self.lkc_residual_scale * self.lkc.alpha
+        residual_a = F.layer_norm(refined_a - phi_a, (self.semantic_dim,))
+        residual_v = F.layer_norm(refined_v - phi_v, (self.semantic_dim,))
+        return phi_a + gate * residual_a, phi_v + gate * residual_v
+
+    def _fuse_and_project(self, phi_a, phi_v, S_a, S_v, P_a, P_v,
+                          collect_feature_debias=False):
         """STFT second-stage fusion + projection.
 
         1. LKC refines the semantic features (phi_a, phi_v) via shared latent
@@ -967,39 +1528,790 @@ class MSTR(nn.Module):
         3. Project to the shared embedding space with V_proj / A_proj.
         Returns (theta_a, theta_v).
         """
-        R_a, R_v = self.lkc(phi_a, phi_v)
-        Y_a, Y_v = self.tucker_fusion(R_a, S_a, R_v, S_v, P_a, P_v)
+        R_a, R_v = self._apply_lkc_residual(phi_a, phi_v)
+        spatial_reliability = None
+        if self.spatial_reliability_gate is not None:
+            gate_a = self.spatial_reliability_gate(R_a, P_a)
+            gate_v = self.spatial_reliability_gate(R_v, P_v)
+            spatial_reliability = (gate_a, gate_v)
+            if collect_feature_debias:
+                self._spatial_reliability_state = (
+                    gate_a.detach(), gate_v.detach())
+        Y_a, Y_v = self.tucker_fusion(
+            R_a, S_a, R_v, S_v, P_a, P_v,
+            spatial_reliability=spatial_reliability)
+        if self.cross_modal_residual is not None:
+            Y_a, Y_v = self.cross_modal_residual(Y_a, Y_v)
+
+        if self.feature_debiaser is not None:
+            # Tucker fusion is intentionally unconstrained in scale.  The
+            # debiaser is an auxiliary representation regularizer, so feeding
+            # its decoder that raw magnitude would make reconstruction dwarf
+            # the task loss.  Decompose a unit-scale visual direction instead.
+            normalized_visual = F.layer_norm(Y_v, (self.semantic_dim,))
+            semantic_visual, residual_visual, reconstructed_visual, residual_text = (
+                self.feature_debiaser(normalized_visual))
+            if collect_feature_debias:
+                self._feature_debias_state = {
+                    "source": normalized_visual.detach(),
+                    "semantic": semantic_visual,
+                    "residual": residual_visual,
+                    "reconstruction": reconstructed_visual,
+                    "residual_text": residual_text,
+                }
+            Y_v = semantic_visual
 
         theta_v = self.V_proj(Y_v)
         theta_a = self.A_proj(Y_a)
         return theta_a, theta_v
 
+    def _standardize_training_embeddings(
+            self, theta_a, theta_v, theta_a_neg, theta_v_neg,
+            theta_w, theta_w_neg):
+        if not self.ahse_standardize:
+            return (theta_a, theta_v, theta_a_neg, theta_v_neg,
+                    theta_w, theta_w_neg)
+        theta_a, theta_v, theta_a_neg, theta_v_neg = (
+            self.av_standardizer.forward_group(
+                theta_a, theta_v, theta_a_neg, theta_v_neg))
+        theta_w, theta_w_neg = self.text_standardizer.forward_group(
+            theta_w, theta_w_neg)
+        return (theta_a, theta_v, theta_a_neg, theta_v_neg,
+                theta_w, theta_w_neg)
+
+    def _standardize_inference_embeddings(self, theta_a, theta_v, theta_w):
+        if not self.ahse_standardize:
+            return theta_a, theta_v, theta_w
+        theta_a, theta_v = self.av_standardizer.forward_group(theta_a, theta_v)
+        theta_w, = self.text_standardizer.forward_group(theta_w)
+        return theta_a, theta_v, theta_w
+
+    def _semantic_geometry_loss(self):
+        """Preserve pairwise text geometry through the learned projection."""
+        projected = torch.cat((self.theta_w_raw, self.theta_w_neg_raw), dim=0)
+        original = torch.cat((self.w, self.w_neg), dim=0).detach()
+        projected = F.normalize(projected, dim=1)
+        original = F.normalize(original, dim=1)
+        projected_similarity = projected @ projected.transpose(0, 1)
+        original_similarity = original @ original.transpose(0, 1)
+        off_diagonal = ~torch.eye(
+            projected_similarity.shape[0], dtype=torch.bool,
+            device=projected_similarity.device)
+        return F.smooth_l1_loss(
+            projected_similarity[off_diagonal],
+            original_similarity[off_diagonal])
+
+    def _semantic_contrastive_loss(self):
+        """Align audio, video, fused AV, and text at the class level.
+
+        The existing triplet objective sees one random negative at a time. This
+        supervised multi-positive InfoNCE term uses every other Seen class in
+        the class-balanced batch as a semantic negative, while repeated samples
+        of the same class remain positives.  The fused AV query is included so
+        training directly supervises the representation used by combined
+        evaluation.  It therefore strengthens the audio/video/text decision
+        geometry without accessing held-out audio/video examples.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError(
+                "semantic contrastive loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError(
+                "semantic contrastive labels must match the batch size")
+
+        positive_mask = labels[:, None].eq(labels[None, :])
+
+        def multi_positive_nce(queries, keys):
+            logits = F.normalize(queries, dim=1) @ F.normalize(
+                keys, dim=1).transpose(0, 1)
+            logits = logits / self.semantic_contrastive_temperature
+            all_log_prob = torch.logsumexp(logits, dim=1)
+            positive_log_prob = torch.logsumexp(
+                logits.masked_fill(~positive_mask, -torch.inf), dim=1)
+            return (all_log_prob - positive_log_prob).mean()
+
+        audio_to_text = multi_positive_nce(self.theta_a, self.theta_w)
+        video_to_text = multi_positive_nce(self.theta_v, self.theta_w)
+        fused_av = 0.5 * (self.theta_a + self.theta_v)
+        av_to_text = multi_positive_nce(fused_av, self.theta_w)
+        text_to_audio = multi_positive_nce(self.theta_w, self.theta_a)
+        text_to_video = multi_positive_nce(self.theta_w, self.theta_v)
+        text_to_av = multi_positive_nce(self.theta_w, fused_av)
+        return (
+            audio_to_text + video_to_text + av_to_text + text_to_audio +
+            text_to_video + text_to_av
+        ) / 6.0
+
+    def set_pseudo_unseen_text_prototypes(self, text_prototypes, class_ids):
+        """Set the train-only class dictionary used by episodic training.
+
+        The dictionary contains only classes available to the current training
+        stage. It is a non-persistent buffer so enabling this auxiliary loss
+        does not change checkpoint compatibility or inference behavior.
+        """
+        text_prototypes = torch.as_tensor(text_prototypes, dtype=torch.float32)
+        class_ids = torch.as_tensor(class_ids, dtype=torch.long).reshape(-1)
+        if (text_prototypes.ndim != 2 or
+                text_prototypes.shape[1] != self.text_embedding_size):
+            raise ValueError(
+                "pseudo-Unseen text prototypes must have shape "
+                f"(classes, {self.text_embedding_size})")
+        if text_prototypes.shape[0] != class_ids.numel() or class_ids.numel() < 2:
+            raise ValueError(
+                "pseudo-Unseen text prototypes and class ids must be aligned")
+        if class_ids.unique().numel() != class_ids.numel():
+            raise ValueError("pseudo-Unseen class ids must be unique")
+        self._pseudo_unseen_text_prototypes = text_prototypes.detach().clone()
+        self._pseudo_unseen_class_ids = class_ids.detach().clone()
+
+    def _pseudo_unseen_episode_loss(self):
+        """Train-only episodic transfer loss over disjoint class subsets.
+
+        A random subset of the classes present in the batch is treated as
+        pseudo-Unseen query classes. Query class prototypes are formed from
+        their current AV embeddings, but classification uses the complete
+        train-stage text dictionary, including the held-out support classes.
+        No validation/test audio or video is accessed.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError(
+                "pseudo-Unseen episodic loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError(
+                "pseudo-Unseen labels must match the batch size")
+        if self._pseudo_unseen_class_ids.numel() < 2:
+            raise RuntimeError(
+                "set_pseudo_unseen_text_prototypes must be called before "
+                "enabling the pseudo-Unseen loss")
+
+        batch_classes = torch.unique(labels, sorted=True)
+        if batch_classes.numel() < self.pseudo_unseen_min_classes + 1:
+            return self.theta_a.new_zeros(())
+        query_count = int(round(
+            batch_classes.numel() * self.pseudo_unseen_class_fraction))
+        query_count = max(self.pseudo_unseen_min_classes, query_count)
+        query_count = min(query_count, batch_classes.numel() - 1)
+        if query_count < self.pseudo_unseen_min_classes:
+            return self.theta_a.new_zeros(())
+
+        permutation = torch.randperm(batch_classes.numel(), device=labels.device)
+        query_classes = batch_classes[permutation[:query_count]]
+        query_mask = torch.isin(labels, query_classes)
+        query_labels = labels[query_mask]
+        query_class_ids, query_inverse = torch.unique(
+            query_labels, sorted=True, return_inverse=True)
+
+        class_count = query_class_ids.numel()
+        if class_count < self.pseudo_unseen_min_classes:
+            return self.theta_a.new_zeros(())
+
+        def class_average(embeddings):
+            prototypes = embeddings.new_zeros(class_count, embeddings.shape[1])
+            prototypes.index_add_(0, query_inverse, embeddings[query_mask])
+            counts = torch.bincount(
+                query_inverse, minlength=class_count).to(
+                    dtype=embeddings.dtype, device=embeddings.device)
+            return prototypes / counts[:, None]
+
+        query_audio = class_average(self.theta_a)
+        query_video = class_average(self.theta_v)
+        query_joint = 0.5 * (query_audio + query_video)
+
+        episode_class_ids = self._pseudo_unseen_class_ids.to(labels.device)
+        matches = query_class_ids[:, None].eq(episode_class_ids[None, :])
+        if not matches.any(dim=1).all():
+            missing = query_class_ids[~matches.any(dim=1)].tolist()
+            raise ValueError(
+                "pseudo-Unseen query classes missing from train dictionary: "
+                f"{missing}")
+        targets = matches.to(dtype=torch.long).argmax(dim=1)
+        text = F.normalize(
+            self.W_proj(self._pseudo_unseen_text_prototypes.to(labels.device)),
+            dim=1)
+
+        def classify(embeddings):
+            logits = F.normalize(embeddings, dim=1) @ text.transpose(0, 1)
+            return F.cross_entropy(
+                logits / self.pseudo_unseen_temperature, targets)
+
+        return (classify(query_audio) + classify(query_video) +
+                classify(query_joint)) / 3.0
+
+    def _cross_modal_contrastive_loss(self):
+        """Align class-level audio and video semantics in the shared space.
+
+        MSTR already supervises both modalities against text, but it has no
+        direct audio-video consistency objective.  This symmetric
+        multi-positive InfoNCE term treats every same-class item as a positive
+        so it aligns event semantics rather than merely matching a clip's
+        incidental audio-video background.  It is auxiliary to the original
+        triplet, projection, and reconstruction losses.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError(
+                "cross-modal contrastive loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError(
+                "cross-modal contrastive labels must match the batch size")
+
+        positive_mask = labels[:, None].eq(labels[None, :])
+
+        def multi_positive_nce(queries, keys):
+            logits = F.normalize(queries, dim=1) @ F.normalize(
+                keys, dim=1).transpose(0, 1)
+            logits = logits / self.cross_modal_contrastive_temperature
+            return (
+                torch.logsumexp(logits, dim=1) - torch.logsumexp(
+                    logits.masked_fill(~positive_mask, -torch.inf), dim=1)
+            ).mean()
+
+        return 0.5 * (
+            multi_positive_nce(self.theta_a, self.theta_v) +
+            multi_positive_nce(self.theta_v, self.theta_a))
+
+    def _avla_contrastive_loss(self):
+        """Standalone joint AV-language alignment over class-level prototypes.
+
+        This follows the supervision form used by EZ-AVGZL while preserving the
+        complete STFT SNN/LKC/Tucker audio-video encoder.  The original MSTR
+        reconstruction and triplet terms are deliberately not combined with
+        this loss, making it a controlled objective replacement rather than
+        another weak auxiliary penalty.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError("AV-language alignment requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_w.shape[0]:
+            raise ValueError("AV-language labels must match the batch size")
+
+        _, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+        class_count = int(inverse.max().item()) + 1
+        if class_count < 2:
+            raise ValueError("AV-language alignment requires at least two classes")
+        class_text = self.theta_w.new_zeros(class_count, self.theta_w.shape[1])
+        class_text.index_add_(0, inverse, self.theta_w)
+        class_counts = torch.bincount(
+            inverse, minlength=class_count).to(
+                dtype=self.theta_w.dtype, device=self.theta_w.device)
+        class_text = class_text / class_counts[:, None]
+
+        theta_av = 0.5 * (self.theta_a + self.theta_v)
+        logits = F.normalize(theta_av, dim=1) @ F.normalize(
+            class_text, dim=1).transpose(0, 1)
+        return F.cross_entropy(logits / self.avla_temperature, inverse)
+
+    def set_global_text_prototypes(self, text_prototypes, class_ids):
+        """Set the final task's semantic dictionary for the training loss.
+
+        Generalized ZSL permits final unseen-class semantic prototypes. No
+        held-out audio/video example is used here. The buffers are deliberately
+        non-persistent, because inference does not require this loss.
+        """
+        text_prototypes = torch.as_tensor(text_prototypes, dtype=torch.float32)
+        class_ids = torch.as_tensor(class_ids, dtype=torch.long).reshape(-1)
+        if (text_prototypes.ndim != 2 or
+                text_prototypes.shape[1] != self.text_embedding_size):
+            raise ValueError(
+                "global text prototypes must have shape "
+                f"(classes, {self.text_embedding_size})")
+        if text_prototypes.shape[0] != class_ids.numel() or class_ids.numel() == 0:
+            raise ValueError(
+                "global prototype texts and class ids must be non-empty and aligned")
+        if class_ids.unique().numel() != class_ids.numel():
+            raise ValueError("global prototype class ids must be unique")
+        self._global_text_prototypes = text_prototypes.detach().clone()
+        self._global_prototype_class_ids = class_ids.detach().clone()
+
+    def _global_prototype_contrastive_loss(self):
+        """Contrast training AV embeddings with the full final class dictionary."""
+        if self._global_text_prototypes.numel() == 0:
+            raise RuntimeError(
+                "global prototype contrastive loss requires final task text "
+                "prototypes; call set_global_text_prototypes before training")
+        if self.batch_labels is None:
+            raise RuntimeError("global prototype contrastive loss requires batch labels")
+
+        labels = self.batch_labels.reshape(-1).to(
+            device=self._global_prototype_class_ids.device, dtype=torch.long)
+        matches = labels[:, None].eq(self._global_prototype_class_ids[None, :])
+        if not matches.any(dim=1).all():
+            missing = labels[~matches.any(dim=1)].unique().tolist()
+            raise ValueError(
+                "training labels missing from global prototype dictionary: "
+                f"{missing}")
+        targets = matches.to(dtype=torch.long).argmax(dim=1)
+        prototype_embeddings = F.normalize(
+            self.W_proj(self._global_text_prototypes), dim=1)
+
+        def prototype_nce(embeddings):
+            logits = F.normalize(embeddings, dim=1) @ prototype_embeddings.T
+            return F.cross_entropy(
+                logits / self.global_prototype_contrastive_temperature, targets)
+
+        theta_av = 0.5 * (self.theta_a + self.theta_v)
+        return (prototype_nce(self.theta_a) + prototype_nce(self.theta_v) +
+                prototype_nce(theta_av)) / 3.0
+
+    def _semantic_hard_negative_loss(self):
+        """Separate each modality from its closest different Seen-class text.
+
+        Random triplets often sample an easy negative.  This term chooses the
+        most semantically similar *different-label* Word2Vec item present in
+        the current class-balanced batch, then enforces a cosine margin in the
+        learned shared space.  Raw text chooses the hard class; projected text
+        remains trainable through the ranking loss.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError(
+                "semantic hard-negative loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError(
+                "semantic hard-negative labels must match the batch size")
+
+        different_class = labels[:, None].ne(labels[None, :])
+        valid_rows = different_class.any(dim=1)
+        if not valid_rows.any():
+            return self.theta_a.new_zeros(())
+
+        raw_text = F.normalize(self.w.detach(), dim=1)
+        semantic_similarity = raw_text @ raw_text.transpose(0, 1)
+        semantic_similarity = semantic_similarity.masked_fill(
+            ~different_class, -torch.inf)
+        hard_indices = semantic_similarity.argmax(dim=1)
+        positive_text = F.normalize(self.theta_w, dim=1)
+        negative_text = positive_text[hard_indices]
+
+        def ranking_loss(modality):
+            modality = F.normalize(modality, dim=1)
+            positive_score = (modality * positive_text).sum(dim=1)
+            negative_score = (modality * negative_text).sum(dim=1)
+            return F.relu(
+                negative_score - positive_score +
+                self.semantic_hard_negative_margin)[valid_rows].mean()
+
+        return 0.5 * (ranking_loss(self.theta_a) + ranking_loss(self.theta_v))
+
+    def _semantic_batch_hard_loss(self):
+        """Separate each AV embedding from its currently closest semantic peer.
+
+        MSTR's sampled triplets use one arbitrary negative clip.  Here the
+        raw word vectors first limit candidates to a small, semantically
+        related neighbourhood; the learned AV-to-text scores then select the
+        currently most confusable class prototype.  Class-level aggregation
+        removes duplicate examples from the decision, and uses Seen training
+        classes only.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError("semantic batch-hard loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError("semantic batch-hard labels must match batch size")
+
+        class_ids, inverse = torch.unique(labels, sorted=True,
+                                          return_inverse=True)
+        class_count = int(class_ids.numel())
+        if class_count < 2:
+            return self.theta_a.new_zeros(())
+
+        def class_average(embeddings):
+            prototypes = embeddings.new_zeros(
+                class_count, embeddings.shape[1])
+            prototypes.index_add_(0, inverse, embeddings)
+            counts = torch.bincount(inverse, minlength=class_count).to(
+                dtype=embeddings.dtype, device=embeddings.device)
+            return prototypes / counts[:, None]
+
+        raw_text = F.normalize(class_average(self.w.detach()), dim=1)
+        text_prototypes = F.normalize(class_average(self.theta_w), dim=1)
+        semantic_similarity = raw_text @ raw_text.transpose(0, 1)
+        semantic_similarity.fill_diagonal_(-torch.inf)
+        neighbor_count = min(self.semantic_batch_hard_neighbors,
+                             class_count - 1)
+        semantic_neighbors = semantic_similarity.topk(
+            neighbor_count, dim=1).indices
+
+        theta_av = F.normalize(0.5 * (self.theta_a + self.theta_v), dim=1)
+        class_scores = theta_av @ text_prototypes.transpose(0, 1)
+        positive_scores = class_scores.gather(1, inverse[:, None]).squeeze(1)
+        neighbor_indices = semantic_neighbors[inverse]
+        hard_scores = class_scores.gather(1, neighbor_indices).max(dim=1).values
+        return F.relu(
+            hard_scores - positive_scores + self.semantic_batch_hard_margin
+        ).mean()
+
+    def _semantic_neighbor_rank_loss(self):
+        """Preserve raw-semantic neighbourhood order in AV-to-text scores.
+
+        Class centres avoid overweighting duplicate samples.  For every Seen
+        training class, its nearest raw-word-vector classes should score above
+        equally many far classes, while its own prototype remains above the
+        nearest alternatives.  No validation or Unseen class is used.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError(
+                "semantic neighbour-rank loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError(
+                "semantic neighbour-rank labels must match batch size")
+
+        class_ids, inverse = torch.unique(
+            labels, sorted=True, return_inverse=True)
+        class_count = int(class_ids.numel())
+        if class_count < 2:
+            return self.theta_a.new_zeros(())
+
+        def class_average(embeddings):
+            centres = embeddings.new_zeros(class_count, embeddings.shape[1])
+            centres.index_add_(0, inverse, embeddings)
+            counts = torch.bincount(inverse, minlength=class_count).to(
+                dtype=embeddings.dtype, device=embeddings.device)
+            return centres / counts[:, None]
+
+        raw_text = F.normalize(class_average(self.w.detach()), dim=1)
+        text_centres = F.normalize(class_average(self.theta_w), dim=1)
+        audio_centres = class_average(self.theta_a)
+        video_centres = class_average(self.theta_v)
+        av_centres = F.normalize(0.5 * (audio_centres + video_centres), dim=1)
+        learned_scores = av_centres @ text_centres.transpose(0, 1)
+
+        raw_similarity = raw_text @ raw_text.transpose(0, 1)
+        diagonal = torch.eye(
+            class_count, dtype=torch.bool, device=raw_similarity.device)
+        ordered = raw_similarity.masked_fill(diagonal, -torch.inf).argsort(
+            dim=1, descending=True)
+        # The diagonal sorts last after masking.  Remove it before taking the
+        # tail; otherwise the matching class would be treated as a far class
+        # and make the two ranking margins contradictory.
+        ordered_nonself = ordered[:, :class_count - 1]
+        neighbor_count = min(
+            self.semantic_neighbor_rank_neighbors,
+            max(1, (class_count - 1) // 2))
+        near_indices = ordered_nonself[:, :neighbor_count]
+        positive_scores = learned_scores.diagonal()[:, None]
+        near_scores = learned_scores.gather(1, near_indices)
+        positive_loss = F.relu(
+            near_scores - positive_scores + self.semantic_neighbor_rank_margin
+        ).mean()
+
+        if class_count == 2:
+            return positive_loss
+        far_indices = ordered_nonself[:, -neighbor_count:]
+        far_scores = learned_scores.gather(1, far_indices)
+        ordering_loss = F.relu(
+            far_scores[:, None, :] - near_scores[:, :, None] +
+            self.semantic_neighbor_rank_margin
+        ).mean()
+        return 0.5 * (positive_loss + ordering_loss)
+
+    def _semantic_mixup_loss(self):
+        """Align mixed AV embeddings with virtual text prototypes.
+
+        The model only sees examples from Seen classes.  Mixing two different
+        Seen-class word vectors creates a local semantic prototype that is not
+        tied to either training label.  The corresponding mixed audio/video
+        embeddings are aligned to it, encouraging a smoother class manifold
+        without accessing an Unseen class name or sample.
+        """
+        labels = self.batch_labels
+        if labels is None:
+            raise RuntimeError("semantic mixup loss requires batch class labels")
+        labels = labels.reshape(-1)
+        if labels.shape[0] != self.theta_a.shape[0]:
+            raise ValueError("semantic mixup labels must match the batch size")
+
+        different_class = labels[:, None].ne(labels[None, :])
+        valid_rows = different_class.any(dim=1)
+        if not valid_rows.any():
+            return self.theta_a.new_zeros(())
+
+        # Draw one partner from a different class for every valid sample.
+        # Argmax over random scores avoids a Python loop and guarantees that a
+        # same-class partner cannot be selected.
+        random_scores = torch.rand(
+            different_class.shape, device=self.theta_a.device,
+            dtype=self.theta_a.dtype)
+        partners = random_scores.masked_fill(~different_class, -1.0).argmax(dim=1)
+
+        source_indices = valid_rows.nonzero(as_tuple=False).squeeze(1)
+        partner_indices = partners[source_indices]
+        alpha = self.semantic_mixup_alpha
+        mixing = torch.distributions.Beta(alpha, alpha).sample(
+            (source_indices.shape[0], 1)).to(
+                device=self.theta_a.device, dtype=self.theta_a.dtype)
+
+        def interpolate(values):
+            return (mixing * values[source_indices] +
+                    (1.0 - mixing) * values[partner_indices])
+
+        # Project the mixed *raw* text embedding so this is not equivalent to
+        # the existing per-sample projection loss through W_proj's nonlinearity.
+        text_mix = self.W_proj(interpolate(self.w))
+        audio_mix = interpolate(self.theta_a)
+        video_mix = interpolate(self.theta_v)
+        joint_mix = 0.5 * (audio_mix + video_mix)
+
+        def cosine_alignment(visual):
+            return 1.0 - F.cosine_similarity(visual, text_mix, dim=1).mean()
+
+        return (cosine_alignment(audio_mix) + cosine_alignment(video_mix) +
+                cosine_alignment(joint_mix)) / 3.0
+
+    def _feature_mixup_loss(self):
+        """Keep the full SNN-STFT encoder smooth between two class features.
+
+        Unlike semantic mixup, this interpolates the paired positive and
+        different-class negative before the temporal SNN, spatial TRL and
+        Tucker fusion.  The interpolated text uses the same coefficient,
+        creating a local pseudo-unseen semantic point without test data.
+        """
+        if self._feature_mixup_inputs is None:
+            raise RuntimeError("feature mixup inputs are missing from the forward pass")
+        if self.ahse_standardize:
+            raise ValueError("feature mixup is not compatible with ahse_standardize")
+        (audio, video, text, negative_audio, negative_video,
+         negative_text) = self._feature_mixup_inputs
+        batch_size = audio.shape[0]
+        mixing = torch.distributions.Beta(
+            self.feature_mixup_alpha, self.feature_mixup_alpha).sample(
+                (batch_size, 1)).to(device=audio.device, dtype=audio.dtype)
+        # Endpoint-biased mixing avoids treating the midpoint of two unrelated
+        # clips as an equally reliable feature sample.
+        mixing = torch.maximum(mixing, 1.0 - mixing)
+
+        def interpolate(positive, negative):
+            return mixing * positive + (1.0 - mixing) * negative
+
+        mixed_audio = interpolate(audio, negative_audio)
+        mixed_video = interpolate(video, negative_video)
+        mixed_text = interpolate(text, negative_text)
+        phi_a, snn_a = self._encode_temporal_audio(mixed_audio)
+        phi_v, snn_v = self._encode_temporal_video(mixed_video)
+        spatial_a, spatial_v = self._encode_spatial(mixed_audio, mixed_video)
+        theta_a, theta_v = self._fuse_and_project(
+            phi_a, phi_v, snn_a, snn_v, spatial_a, spatial_v)
+        theta_w = self.W_proj(mixed_text)
+
+        def cosine_alignment(embedding):
+            return 1.0 - F.cosine_similarity(embedding, theta_w, dim=1).mean()
+
+        return 0.5 * (cosine_alignment(theta_a) + cosine_alignment(theta_v))
+
+    def _feature_debias_loss(self):
+        """Regularize the optional visual semantic/residual decomposition."""
+        if self._feature_debias_state is None:
+            raise RuntimeError("feature debias state is missing from the positive branch")
+        labels = self.batch_labels.reshape(-1)
+        state = self._feature_debias_state
+        semantic = state["semantic"]
+        residual = state["residual"]
+
+        reconstruction = self.criterion_reg(
+            state["reconstruction"], state["source"])
+
+        semantic_normalized = F.normalize(semantic, dim=1)
+        semantic_similarity = semantic_normalized @ semantic_normalized.transpose(0, 1)
+        same_class = labels[:, None].eq(labels[None, :])
+        same_class.fill_diagonal_(False)
+        if same_class.any():
+            compactness = (1.0 - semantic_similarity[same_class]).mean()
+        else:
+            compactness = semantic.new_zeros(())
+
+        # An orthogonal residual is less likely to duplicate the semantic path.
+        orthogonality = (
+            (F.normalize(semantic, dim=1) * F.normalize(residual, dim=1))
+            .sum(dim=1).square().mean())
+
+        positive_mask = labels[:, None].eq(labels[None, :])
+        residual_logits = (
+            F.normalize(state["residual_text"], dim=1) @
+            F.normalize(self.theta_w.detach(), dim=1).transpose(0, 1))
+        residual_logits = residual_logits / self.feature_debias_temperature
+        residual_text = (
+            torch.logsumexp(residual_logits, dim=1) -
+            torch.logsumexp(
+                residual_logits.masked_fill(~positive_mask, -torch.inf),
+                dim=1)).mean()
+
+        # Reconstruction and same-class consistency carry the main signal;
+        # the two auxiliary terms are deliberately downweighted for stability.
+        total = reconstruction + compactness + 0.1 * (
+            orthogonality + residual_text)
+        return total, {
+            "feature_debias_reconstruction": reconstruction,
+            "feature_debias_compactness": compactness,
+            "feature_debias_orthogonality": orthogonality,
+            "feature_debias_residual_text": residual_text,
+        }
+
+    def _snn_activity_floor_loss(self):
+        """Penalize only final-layer firing rates below a sparse target.
+
+        The hard-spike forward path and DTH updates remain untouched. This term
+        only prevents the temporal branch from becoming silent enough to be
+        bypassed by the semantic path.
+        """
+        if self._positive_snn_rates is None:
+            raise RuntimeError("SNN activity-floor state is missing from the positive branch")
+        audio_rate, video_rate = self._positive_snn_rates
+        target = self.snn_min_spike_rate
+
+        def floor_penalty(rate):
+            return (F.relu(target - rate) / target).square()
+
+        return 0.5 * (floor_penalty(audio_rate) + floor_penalty(video_rate))
+
+    @staticmethod
+    def _project_with_frozen_batchnorm(projector, features):
+        """Project an auxiliary view without updating the shared BN state."""
+        was_training = projector.training
+        if was_training:
+            projector.eval()
+        try:
+            return projector(features)
+        finally:
+            if was_training:
+                projector.train()
+
+    def _build_snn_temporal_view(self, theta_a, theta_v, theta_w):
+        """Create the training-only view with semantic and spatial paths absent.
+
+        The view begins directly at each SNN output and reuses the normal
+        modality projection head.  It therefore cannot obtain information
+        from the semantic encoder, LKC, Tucker core, or TRL branch.  BatchNorm
+        statistics remain those of the normal fused path above.
+        """
+        temporal_a = self._project_with_frozen_batchnorm(
+            self.A_proj, self.phi_a1)
+        temporal_v = self._project_with_frozen_batchnorm(
+            self.V_proj, self.phi_v1)
+        self._snn_temporal_view = (temporal_a, temporal_v)
+        self._snn_temporal_teachers = (
+            theta_a.detach(), theta_v.detach(), theta_w.detach())
+
+    def _snn_temporal_consistency_loss(self):
+        """Align a randomly selected pure-SNN view to text and fused teachers."""
+        if (self._snn_temporal_view is None or
+                self._snn_temporal_teachers is None):
+            raise RuntimeError("SNN temporal-view state is missing from the positive branch")
+        temporal_a, temporal_v = self._snn_temporal_view
+        teacher_a, teacher_v, teacher_w = self._snn_temporal_teachers
+        batch_size = temporal_a.shape[0]
+        if self.snn_temporal_view_fraction >= 1.0:
+            selected = torch.ones(
+                batch_size, device=temporal_a.device, dtype=torch.bool)
+        else:
+            selected = torch.rand(
+                batch_size, device=temporal_a.device) < self.snn_temporal_view_fraction
+            # Keep the auxiliary objective present even in a small final batch.
+            if not selected.any():
+                selected[torch.randint(batch_size, (1,), device=selected.device)] = True
+
+        def view_error(temporal, fused_teacher):
+            text_alignment = 1.0 - F.cosine_similarity(
+                temporal, teacher_w, dim=1)
+            fused_alignment = 1.0 - F.cosine_similarity(
+                temporal, fused_teacher, dim=1)
+            return 0.5 * (text_alignment + fused_alignment)
+
+        audio_error = view_error(temporal_a, teacher_a)
+        video_error = view_error(temporal_v, teacher_v)
+        loss = 0.5 * (audio_error[selected].mean() +
+                      video_error[selected].mean())
+        return loss, selected.float().mean()
+
+    def _temporal_quality_alignment_loss(self):
+        """Align semantic and SNN temporal directions on both triplet views.
+
+        The loss is train-only and uses no class or validation information. It
+        regularizes the internal quality signal used by the rejected post-hoc
+        fusion, so that the signal is learned consistently in both stages.
+        """
+        if self._temporal_quality_features is None:
+            raise RuntimeError("Temporal-quality features are missing from the positive branch")
+        features = self._temporal_quality_features
+        pairs = ((features[0], features[1]), (features[2], features[3]),
+                 (features[4], features[5]), (features[6], features[7]))
+        agreement = torch.stack([
+            1.0 - F.cosine_similarity(semantic, temporal, dim=1).mean()
+            for semantic, temporal in pairs])
+        return agreement.mean()
+
     def forward(self, audio, image, negative_audio, negative_image, word_embedding, negative_word_embedding):
+        self._feature_debias_state = None
+        self._feature_mixup_inputs = None
+        self._positive_snn_rates = None
+        self._snn_temporal_view = None
+        self._snn_temporal_teachers = None
+        self._spatial_reliability_state = None
+        self._snn_runtime_diagnostics = {}
         # --- temporal-semantic branch (positive) ---
         # phi_* and phi_*1 are semantic_dim encoder and SNN features.
         self.phi_a, self.phi_a1 = self._encode_temporal_audio(audio)
+        self._snn_runtime_diagnostics["snn_audio_spike_rate"] = (
+            self.SNNbranchaudio._last_spike_rate)
+        self._snn_runtime_diagnostics["snn_audio_threshold"] = (
+            self.SNNbranchaudio._last_dth_threshold)
         self.phi_v, self.phi_v1 = self._encode_temporal_video(image)
+        self._snn_runtime_diagnostics["snn_video_spike_rate"] = (
+            self.SNNbranchvideo._last_spike_rate)
+        self._snn_runtime_diagnostics["snn_video_threshold"] = (
+            self.SNNbranchvideo._last_dth_threshold)
+        self._positive_snn_rates = (
+            self.SNNbranchaudio._last_spike_rate_for_loss,
+            self.SNNbranchvideo._last_spike_rate_for_loss)
         # --- temporal-semantic branch (negative) ---
         self.phi_a_neg, self.phi_a_neg1 = self._encode_temporal_audio(negative_audio)
         self.phi_v_neg, self.phi_v_neg1 = self._encode_temporal_video(negative_image)
+        if self.temporal_quality_alignment_weight > 0.0:
+            self._temporal_quality_features = (
+                self.phi_a, self.phi_a1, self.phi_v, self.phi_v1,
+                self.phi_a_neg, self.phi_a_neg1,
+                self.phi_v_neg, self.phi_v_neg1)
         self.phi_at, self.phi_vt = self._encode_spatial(audio, image)
         self.phi_at_neg, self.phi_vt_neg = self._encode_spatial(
             negative_audio, negative_image)
         # --- text / semantic projection ---
         self.w = word_embedding
         self.w_neg = negative_word_embedding
-        self.theta_w = self.W_proj(word_embedding)
-        self.theta_w_neg = self.W_proj(negative_word_embedding)
-        self.rho_w = self.D(self.theta_w)
+        if self.feature_mixup_weight > 0.0:
+            self._feature_mixup_inputs = (
+                audio, image, word_embedding, negative_audio,
+                negative_image, negative_word_embedding)
+        theta_w = self.W_proj(word_embedding)
+        theta_w_neg = self.W_proj(negative_word_embedding)
+        self.theta_w_raw = theta_w
+        self.theta_w_neg_raw = theta_w_neg
 
         # --- STFT second-stage fusion + projection ---
         # Fuses semantic (phi) + temporal (phi_*1) per modality via LKC + Tucker.
-        self.theta_a, self.theta_v = self._fuse_and_project(
+        theta_a, theta_v = self._fuse_and_project(
             self.phi_a, self.phi_v, self.phi_a1, self.phi_v1,
-            self.phi_at, self.phi_vt)
-        self.theta_a_neg, self.theta_v_neg = self._fuse_and_project(
+            self.phi_at, self.phi_vt, collect_feature_debias=True)
+        theta_a_neg, theta_v_neg = self._fuse_and_project(
             self.phi_a_neg, self.phi_v_neg, self.phi_a_neg1, self.phi_v_neg1,
             self.phi_at_neg, self.phi_vt_neg)
+        if self.snn_temporal_consistency_weight > 0.0 and self.training:
+            self._build_snn_temporal_view(theta_a, theta_v, theta_w)
+
+        (self.theta_a, self.theta_v, self.theta_a_neg,
+         self.theta_v_neg, self.theta_w, self.theta_w_neg) = (
+            self._standardize_training_embeddings(
+                theta_a, theta_v, theta_a_neg, theta_v_neg,
+                theta_w, theta_w_neg))
+        self.rho_w = self.D(self.theta_w)
 
         # --- reconstruction heads ---
         self.phi_v_rec = self.V_rec(self.theta_v)
@@ -1008,7 +2320,8 @@ class MSTR(nn.Module):
         self.rho_a = self.D(self.theta_a)
         self.rho_v = self.D(self.theta_v)
 
-    def backward(self, optimize):
+    def backward(self, optimize, teacher_embeddings=None, teacher_mask=None,
+                 teacher_weight=0.0):
         # STFT Eq. 16: a joint audio-visual embedding is contrasted with its
         # positive text and both negative text / negative AV examples.
         theta_av = 0.5 * (self.theta_a + self.theta_v)
@@ -1047,8 +2360,122 @@ class MSTR(nn.Module):
             self.criterion_reg(self.rho_w, self.w)
         ) / 5.0
 
-        # Paper setting: L_all = 0.5 L_t + 0.5 (L_p + L_r).
-        loss_gen = 0.5 * l_triplet + 0.5 * (l_projection + l_reconstruction)
+        avla_contrastive = None
+        if self.avla_contrastive_only:
+            avla_contrastive = self._avla_contrastive_loss()
+            loss_gen = avla_contrastive
+        else:
+            # Paper setting: L_all = 0.5 L_t + 0.5 (L_p + L_r).
+            loss_gen = 0.5 * l_triplet + 0.5 * (l_projection + l_reconstruction)
+        semantic_geometry = None
+        if self.semantic_geometry_weight > 0.0:
+            semantic_geometry = self._semantic_geometry_loss()
+            loss_gen = loss_gen + self.semantic_geometry_weight * semantic_geometry
+        semantic_contrastive = None
+        if self.semantic_contrastive_weight > 0.0:
+            semantic_contrastive = self._semantic_contrastive_loss()
+            loss_gen = loss_gen + (
+                self.semantic_contrastive_weight * semantic_contrastive)
+        pseudo_unseen = None
+        # This objective intentionally uses only the current training-stage
+        # class dictionary. Validation contains held-out class ids, so it must
+        # never be evaluated there or it would either fail or leak protocol
+        # information into the validation loss.
+        if self.pseudo_unseen_weight > 0.0 and optimize:
+            pseudo_unseen = self._pseudo_unseen_episode_loss()
+            loss_gen = loss_gen + self.pseudo_unseen_weight * pseudo_unseen
+        snn_temporal_consistency = None
+        snn_temporal_view_coverage = None
+        if self.snn_temporal_consistency_weight > 0.0 and optimize:
+            (snn_temporal_consistency,
+             snn_temporal_view_coverage) = self._snn_temporal_consistency_loss()
+            loss_gen = loss_gen + (
+                self.snn_temporal_consistency_weight *
+                snn_temporal_consistency)
+        temporal_quality_alignment = None
+        if self.temporal_quality_alignment_weight > 0.0 and optimize:
+            temporal_quality_alignment = self._temporal_quality_alignment_loss()
+            loss_gen = loss_gen + (
+                self.temporal_quality_alignment_weight *
+                temporal_quality_alignment)
+        cross_modal_contrastive = None
+        if self.cross_modal_contrastive_weight > 0.0:
+            cross_modal_contrastive = self._cross_modal_contrastive_loss()
+            loss_gen = loss_gen + (
+                self.cross_modal_contrastive_weight *
+                cross_modal_contrastive)
+        global_prototype_contrastive = None
+        if self.global_prototype_contrastive_weight > 0.0:
+            global_prototype_contrastive = self._global_prototype_contrastive_loss()
+            loss_gen = loss_gen + (
+                self.global_prototype_contrastive_weight *
+                global_prototype_contrastive)
+        semantic_hard_negative = None
+        if self.semantic_hard_negative_weight > 0.0:
+            semantic_hard_negative = self._semantic_hard_negative_loss()
+            loss_gen = loss_gen + (
+                self.semantic_hard_negative_weight * semantic_hard_negative)
+        semantic_batch_hard = None
+        if self.semantic_batch_hard_weight > 0.0:
+            semantic_batch_hard = self._semantic_batch_hard_loss()
+            loss_gen = loss_gen + (
+                self.semantic_batch_hard_weight * semantic_batch_hard)
+        semantic_neighbor_rank = None
+        if self.semantic_neighbor_rank_weight > 0.0 and optimize:
+            semantic_neighbor_rank = self._semantic_neighbor_rank_loss()
+            loss_gen = loss_gen + (
+                self.semantic_neighbor_rank_weight * semantic_neighbor_rank)
+        semantic_mixup = None
+        if self.semantic_mixup_weight > 0.0:
+            semantic_mixup = self._semantic_mixup_loss()
+            loss_gen = loss_gen + self.semantic_mixup_weight * semantic_mixup
+        feature_mixup = None
+        if self.feature_mixup_weight > 0.0:
+            feature_mixup = self._feature_mixup_loss()
+            loss_gen = loss_gen + self.feature_mixup_weight * feature_mixup
+        feature_debias = None
+        feature_debias_details = None
+        if self.feature_debiaser is not None:
+            feature_debias, feature_debias_details = self._feature_debias_loss()
+            loss_gen = loss_gen + self.feature_debias_weight * feature_debias
+
+        snn_activity_floor = None
+        if self.snn_activity_floor_weight > 0.0:
+            snn_activity_floor = self._snn_activity_floor_loss()
+            loss_gen = loss_gen + (
+                self.snn_activity_floor_weight * snn_activity_floor)
+
+        seen_distill = None
+        seen_distill_coverage = None
+        if teacher_embeddings is not None:
+            if len(teacher_embeddings) != 2:
+                raise ValueError(
+                    "Stage B teacher embeddings must contain audio and video tensors")
+            teacher_a, teacher_v = teacher_embeddings
+            if teacher_mask is None:
+                raise ValueError(
+                    "Stage B teacher distillation requires a seen-class mask")
+            teacher_mask = teacher_mask.reshape(-1).bool()
+            if teacher_mask.shape[0] != self.theta_a.shape[0]:
+                raise ValueError(
+                    "Stage B teacher mask must match the current batch size")
+            if teacher_a.shape != self.theta_a.shape or teacher_v.shape != self.theta_v.shape:
+                raise ValueError(
+                    "Stage B teacher embeddings must match the student modality shapes")
+            if teacher_weight < 0.0:
+                raise ValueError("Stage B teacher weight must be non-negative")
+            seen_distill_coverage = teacher_mask.float().mean()
+            if teacher_mask.any():
+                audio_alignment = 1.0 - F.cosine_similarity(
+                    self.theta_a[teacher_mask], teacher_a.detach()[teacher_mask],
+                    dim=1).mean()
+                video_alignment = 1.0 - F.cosine_similarity(
+                    self.theta_v[teacher_mask], teacher_v.detach()[teacher_mask],
+                    dim=1).mean()
+                seen_distill = 0.5 * (audio_alignment + video_alignment)
+            else:
+                seen_distill = self.theta_a.new_zeros(())
+            loss_gen = loss_gen + float(teacher_weight) * seen_distill
 
         if optimize == True:
             self.optimizer_gen.zero_grad()
@@ -1057,18 +2484,142 @@ class MSTR(nn.Module):
 
         loss = {'triplet': l_triplet, 'projection': l_projection,
                 'reconstruction': l_reconstruction, 'gen': loss_gen}
+        if semantic_geometry is not None:
+            loss['semantic_geometry'] = semantic_geometry
+        if semantic_contrastive is not None:
+            loss['semantic_contrastive'] = semantic_contrastive
+        if pseudo_unseen is not None:
+            loss['pseudo_unseen'] = pseudo_unseen
+        if snn_temporal_consistency is not None:
+            loss['snn_temporal_consistency'] = snn_temporal_consistency
+            loss['snn_temporal_view_coverage'] = snn_temporal_view_coverage
+        if temporal_quality_alignment is not None:
+            loss['temporal_quality_alignment'] = temporal_quality_alignment
+        if cross_modal_contrastive is not None:
+            loss['cross_modal_contrastive'] = cross_modal_contrastive
+        if avla_contrastive is not None:
+            loss['avla_contrastive'] = avla_contrastive
+        if global_prototype_contrastive is not None:
+            loss['global_prototype_contrastive'] = global_prototype_contrastive
+        if semantic_hard_negative is not None:
+            loss['semantic_hard_negative'] = semantic_hard_negative
+        if semantic_batch_hard is not None:
+            loss['semantic_batch_hard'] = semantic_batch_hard
+        if semantic_neighbor_rank is not None:
+            loss['semantic_neighbor_rank'] = semantic_neighbor_rank
+        if semantic_mixup is not None:
+            loss['semantic_mixup'] = semantic_mixup
+        if feature_mixup is not None:
+            loss['feature_mixup'] = feature_mixup
+        if feature_debias is not None:
+            loss['feature_debias'] = feature_debias
+            loss.update(feature_debias_details)
+        if snn_activity_floor is not None:
+            loss['snn_activity_floor'] = snn_activity_floor
+        if seen_distill is not None:
+            loss['seen_distill'] = seen_distill
+            loss['seen_distill_coverage'] = seen_distill_coverage
 
         loss_numeric = loss_gen
 
         return loss_numeric, loss
 
-    def optimize_params(self, audio, video, cls_numeric, cls_embedding,audio_negative, video_negative, negative_cls_embedding,optimize=False):
-
+    def optimize_params(self, audio, video, cls_numeric, cls_embedding,
+                        audio_negative, video_negative, negative_cls_embedding,
+                        optimize=False, teacher_embeddings=None, teacher_mask=None,
+                        teacher_weight=0.0):
+        self.batch_labels = cls_numeric.detach()
         self.forward(audio, video, audio_negative, video_negative, cls_embedding, negative_cls_embedding)
 
-        loss_numeric, loss = self.backward(optimize)
+        loss_numeric, loss = self.backward(
+            optimize, teacher_embeddings=teacher_embeddings,
+            teacher_mask=teacher_mask, teacher_weight=teacher_weight)
 
         return loss_numeric, loss
+
+    def get_runtime_diagnostics(self):
+        """Return detached scalar SNN health signals from the positive branch."""
+        diagnostics = dict(self._snn_runtime_diagnostics)
+        if self._spatial_reliability_state is not None:
+            audio_gate, video_gate = self._spatial_reliability_state
+            diagnostics.update(
+                spatial_audio_gate_mean=audio_gate.mean(),
+                spatial_audio_gate_std=audio_gate.std(unbiased=False),
+                spatial_video_gate_mean=video_gate.mean(),
+                spatial_video_gate_std=video_gate.std(unbiased=False),
+            )
+        return diagnostics
+
+    def recalibrate_text_batchnorm(self, text_prototypes, mix=1.0):
+        """Re-estimate ``W_proj`` BatchNorm statistics from class semantics.
+
+        The text projection is trained on Seen-class word vectors but projects
+        a Seen+Unseen class dictionary at GZSL evaluation.  Class semantics are
+        available in the standard zero-shot protocol, so this evaluation-only
+        diagnostic uses no audio/video example and updates no learned weight.
+        """
+        if self.text_projection_norm != "batchnorm":
+            raise ValueError(
+                "text BatchNorm recalibration requires "
+                "text_projection_norm='batchnorm'")
+        if not 0.0 <= mix <= 1.0:
+            raise ValueError("text BatchNorm recalibration mix must be in [0, 1]")
+
+        text_prototypes = torch.as_tensor(
+            text_prototypes, dtype=torch.float32,
+            device=next(self.W_proj.parameters()).device)
+        if (text_prototypes.ndim != 2 or
+                text_prototypes.shape[1] != self.text_embedding_size):
+            raise ValueError(
+                "text prototypes for BatchNorm recalibration must have shape "
+                f"(classes, {self.text_embedding_size})")
+        if text_prototypes.shape[0] < 2:
+            raise ValueError(
+                "text BatchNorm recalibration requires at least two classes")
+
+        batch_norms = [module for module in self.W_proj.modules()
+                       if isinstance(module, nn.BatchNorm1d)]
+        if not batch_norms:
+            raise RuntimeError("W_proj does not contain BatchNorm layers")
+
+        prior_statistics = [
+            (module.running_mean.detach().clone(),
+             module.running_var.detach().clone(),
+             module.num_batches_tracked.detach().clone(), module.momentum)
+            for module in batch_norms]
+        dropout_states = [
+            (module, module.training)
+            for module in self.W_proj.modules()
+            if isinstance(module, nn.Dropout)]
+        was_training = self.W_proj.training
+
+        try:
+            # ``momentum=1`` records the complete task dictionary exactly.
+            # Disabling dropout keeps any downstream BatchNorm deterministic.
+            self.W_proj.train()
+            for dropout, _ in dropout_states:
+                dropout.eval()
+            for batch_norm in batch_norms:
+                batch_norm.momentum = 1.0
+            with torch.no_grad():
+                self.W_proj(text_prototypes)
+
+            for batch_norm, (old_mean, old_var, _, _) in zip(
+                    batch_norms, prior_statistics):
+                batch_norm.running_mean.copy_(
+                    old_mean.lerp(batch_norm.running_mean, mix))
+                batch_norm.running_var.copy_(
+                    old_var.lerp(batch_norm.running_var, mix))
+        finally:
+            for batch_norm, (_, _, old_count, old_momentum) in zip(
+                    batch_norms, prior_statistics):
+                batch_norm.num_batches_tracked.copy_(old_count)
+                batch_norm.momentum = old_momentum
+            for dropout, was_dropout_training in dropout_states:
+                dropout.train(was_dropout_training)
+            self.W_proj.train(was_training)
+
+        return len(batch_norms)
 
     def get_embeddings(self, audio, video, embedding):
         # Inference path: only the positive branch is needed.
@@ -1081,4 +2632,5 @@ class MSTR(nn.Module):
 
         theta_a, theta_v = self._fuse_and_project(
             phi_a, phi_v, phi_a1, phi_v1, phi_at, phi_vt)
-        return theta_a, theta_v, theta_w
+        return self._standardize_inference_embeddings(
+            theta_a, theta_v, theta_w)

@@ -47,7 +47,9 @@ def create_logger(filepath):
 
     # create logger and set level to debug
     logger = logging.getLogger()
-    logger.handlers = []
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     if filepath is not None:

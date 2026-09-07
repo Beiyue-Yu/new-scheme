@@ -3,6 +3,7 @@ import logging
 import pickle
 import random
 import socket
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -10,9 +11,17 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 from src.logger import PD_Stats, create_logger
+
+
+class NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
 
 
 def read_features(path):
@@ -37,10 +46,13 @@ def setup_experiment(args, *stats):
         exp_name = "runs/" + str(args.exp_name)
         #exp_name = "/mnt/store_runs/" + str(args.exp_name)
     log_dir = (args.dump_path / exp_name)
-    log_dir.mkdir(parents=True)
+    is_resume = getattr(args, "resume_checkpoint", None) is not None
+    allow_existing = getattr(args, "allow_existing_run", False)
+    log_dir.mkdir(parents=True, exist_ok=is_resume or allow_existing)
     (log_dir / "checkpoints").mkdir(
-        exist_ok=getattr(args, "resume_checkpoint", None) is not None)
-    pickle.dump(args, (log_dir / "args.pkl").open("wb"))
+        exist_ok=is_resume or allow_existing)
+    with (log_dir / "args.pkl").open("wb") as args_file:
+        pickle.dump(args, args_file)
     train_stats = PD_Stats(log_dir / "train_stats.pkl", stats)
     val_stats = PD_Stats(log_dir / "val_stats.pkl", stats)
     logger = create_logger(log_dir / "train.log")
@@ -51,10 +63,14 @@ def setup_experiment(args, *stats):
     )
     logger.info(f"The experiment will be stored in {log_dir.resolve()}\n")
     logger.info("")
-    if args.exp_name == "":
-        writer = SummaryWriter()
+    if getattr(args, "disable_tensorboard", False):
+        writer = NullSummaryWriter()
     else:
-        writer = SummaryWriter(log_dir=exp_name)
+        from torch.utils.tensorboard import SummaryWriter
+        if args.exp_name == "":
+            writer = SummaryWriter()
+        else:
+            writer = SummaryWriter(log_dir=exp_name)
     return logger, log_dir, writer, train_stats, val_stats
 
 
@@ -121,6 +137,10 @@ def save_training_state(epoch, model, optimizer, scheduler, log_dir,
     temporary = log_dir / "last.pt.tmp"
     torch.save(state, temporary)
     temporary.replace(destination)
+    epoch_destination = log_dir / "last_epoch.txt"
+    epoch_temporary = log_dir / "last_epoch.txt.tmp"
+    epoch_temporary.write_text(f"{epoch + 1}\n", encoding="ascii")
+    epoch_temporary.replace(epoch_destination)
 
 
 def load_training_state(path, model, optimizer, scheduler):
@@ -131,11 +151,32 @@ def load_training_state(path, model, optimizer, scheduler):
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and state.get("scheduler") is not None:
         scheduler.load_state_dict(state["scheduler"])
-    torch.set_rng_state(state["torch_rng_state"])
-    np.random.set_state(state["numpy_rng_state"])
-    random.setstate(state["python_rng_state"])
+
+    logger = logging.getLogger()
+    try:
+        torch.set_rng_state(state["torch_rng_state"])
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        logger.warning("Skipping incompatible CPU RNG state from checkpoint: %s", error)
+    if state.get("numpy_rng_state") is not None:
+        np.random.set_state(state["numpy_rng_state"])
+    if state.get("python_rng_state") is not None:
+        random.setstate(state["python_rng_state"])
     if torch.cuda.is_available() and state.get("cuda_rng_state_all") is not None:
-        torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+        saved_cuda_states = state["cuda_rng_state_all"]
+        current_cuda_states = torch.cuda.get_rng_state_all()
+        saved_sizes = [rng_state.numel() for rng_state in saved_cuda_states]
+        current_sizes = [rng_state.numel() for rng_state in current_cuda_states]
+        if saved_sizes != current_sizes:
+            logger.warning(
+                "Skipping incompatible CUDA RNG state from checkpoint: "
+                "saved sizes %s, current sizes %s", saved_sizes, current_sizes)
+        else:
+            try:
+                torch.cuda.set_rng_state_all(saved_cuda_states)
+            except (RuntimeError, TypeError, ValueError) as error:
+                logger.warning(
+                    "Skipping incompatible CUDA RNG state from checkpoint: %s",
+                    error)
     return state["epoch"], state.get("best_loss"), state.get("best_score")
 
 
@@ -205,7 +246,13 @@ def cos_dist(a, b):
 
 def evaluate_dataset_baseline(dataset, model, device, distance_fn, best_beta=None,
                               new_model_attention=False, model_devise=False, apn=False,
-                              args=None, save_performances=False):
+                              args=None, save_performances=False,
+                              best_fusion_weight=None,
+                              adaptive_modality_fusion=False,
+                              energy_ood_routing=False,
+                              best_energy_threshold=None,
+                              energy_ood_score="raw",
+                              energy_ood_score_model=None):
     data = dataset.all_data
     data_a = data["audio"].to(device)
     data_v = data["video"].to(device)
@@ -260,14 +307,32 @@ def evaluate_dataset_baseline(dataset, model, device, distance_fn, best_beta=Non
         video_evaluation = get_best_evaluation(dataset, all_targets, a_p, v_p, t_p, mode="video", device=device,
                                                distance_fn=distance_fn, best_beta=best_beta, save_performances=save_performances,args=args)
         both_evaluation = get_best_evaluation(dataset, all_targets, a_p, v_p, t_p, mode="both", device=device,
-                                              distance_fn=distance_fn, best_beta=best_beta, save_performances=save_performances,args=args)
+                                              distance_fn=distance_fn, best_beta=best_beta,
+                                              best_fusion_weight=best_fusion_weight,
+                                              adaptive_modality_fusion=adaptive_modality_fusion,
+                                              save_performances=save_performances,args=args)
 
     if  new_model_attention == True:
-        return {
+        evaluation = {
             "audio": audio_evaluation,
             "video": video_evaluation,
             "both": both_evaluation
         }
+        if energy_ood_routing:
+            score_embeddings = None
+            if energy_ood_score_model is not None:
+                energy_ood_score_model.eval()
+                with torch.no_grad():
+                    score_embeddings = energy_ood_score_model.get_embeddings(
+                        all_data[0], all_data[1],
+                        all_data[3] if new_model_attention else all_data[2])
+            evaluation["energy_ood"] = get_energy_ood_evaluation(
+                dataset, all_targets, a_p, v_p, t_p,
+                distance_fn=distance_fn,
+                threshold=best_energy_threshold,
+                score_normalization=energy_ood_score,
+                score_embeddings=score_embeddings)
+        return evaluation
     elif model_devise == True or apn == True:
         return {
             "audio": audio_evaluation,
@@ -277,15 +342,33 @@ def evaluate_dataset_baseline(dataset, model, device, distance_fn, best_beta=Non
 
 
 
-def get_best_evaluation(dataset, targets, a_p, v_p, t_p, mode, device, distance_fn, best_beta=None, save_performances=False, args=None, attention_weights=None):
+def get_best_evaluation(dataset, targets, a_p, v_p, t_p, mode, device,
+                        distance_fn, best_beta=None, save_performances=False,
+                        args=None, attention_weights=None,
+                        best_fusion_weight=None,
+                        adaptive_modality_fusion=False):
     seen_scores = []
     zsl_scores = []
     unseen_scores = []
     hm_scores = []
     per_class_recalls = []
-    start = 0
-    end = 3
-    steps = (end - start) * 5 + 1
+    gzsl_per_class_recalls = []
+    start = 0.0
+    end = float(getattr(args, "evaluation_beta_max", 3.0))
+    if end <= start:
+        raise ValueError("evaluation_beta_max must be positive")
+    if isinstance(best_beta, Mapping):
+        best_beta = best_beta[mode]
+    # The optional adaptive search uses a 0.1 beta step. The default fixed-sum
+    # protocol retains the released 0.2 grid for historical comparability.
+    default_beta_step = (
+        0.1 if mode == "both" and adaptive_modality_fusion else 0.2)
+    configured_beta_step = getattr(args, "evaluation_beta_step", None)
+    beta_step = (default_beta_step if configured_beta_step is None
+                 else float(configured_beta_step))
+    if beta_step <= 0:
+        raise ValueError("evaluation_beta_step must be positive")
+    steps = int(round((end - start) / beta_step)) + 1
     betas = (torch.tensor([best_beta], dtype=torch.float, device=device)
              if best_beta is not None else torch.linspace(start, end, steps, device=device))
     seen_label_array = torch.tensor(dataset.seen_class_ids, dtype=torch.long, device=device)
@@ -293,97 +376,162 @@ def get_best_evaluation(dataset, targets, a_p, v_p, t_p, mode, device, distance_
     seen_unseen_array = torch.tensor(np.sort(np.concatenate((dataset.seen_class_ids, dataset.unseen_class_ids))),
                                      dtype=torch.long, device=device)
 
-    classes_embeddings = t_p
+    normalize_shared_embeddings = bool(
+        getattr(args, "normalize_shared_embeddings", False))
+    classes_embeddings = (
+        F.normalize(t_p, dim=1) if normalize_shared_embeddings else t_p)
+    distance_audio_embeddings = (
+        F.normalize(a_p, dim=1)
+        if normalize_shared_embeddings and a_p is not None else a_p)
+    distance_video_embeddings = (
+        F.normalize(v_p, dim=1)
+        if normalize_shared_embeddings and v_p is not None else v_p)
+    candidate_betas = []
+    candidate_audio_weights = []
     with torch.no_grad():
-        for beta in betas:
-            if a_p is None:
-                distance_mat = torch.zeros((v_p.shape[0], len(dataset.all_class_ids)), dtype=torch.float,
-                                           device=device) + 99999999999999
-                distance_mat_zsl = torch.zeros((v_p.shape[0], len(dataset.all_class_ids)), dtype=torch.float,
-                                               device=device) + 99999999999999
+        semantic_aware_calibration = bool(
+            getattr(args, "semantic_aware_calibration", False))
+        seen_penalty_scales = torch.ones(
+            len(seen_label_array), dtype=classes_embeddings.dtype,
+            device=device)
+        if semantic_aware_calibration:
+            # Calibrated stacking penalizes every Seen prototype equally. A
+            # Seen class whose learned semantic prototype is close to an
+            # Unseen prototype is more likely to absorb that class's samples,
+            # so allocate more of the same mean beta budget to it. This uses
+            # only the standard GZSL class dictionary, never sample labels.
+            normalized_classes = F.normalize(classes_embeddings, dim=1)
+            seen_positions = torch.searchsorted(
+                seen_unseen_array, seen_label_array)
+            unseen_positions = torch.searchsorted(
+                seen_unseen_array, unseen_label_array)
+            seen_to_unseen_similarity = (
+                normalized_classes[seen_positions] @
+                normalized_classes[unseen_positions].transpose(0, 1))
+            seen_affinity = seen_to_unseen_similarity.max(dim=1).values
+            mean_affinity = seen_affinity.mean().clamp_min(
+                torch.finfo(seen_affinity.dtype).eps)
+            seen_penalty_scales = seen_affinity / mean_affinity
+
+        if mode in {"audio", "video", "both"}:
+            audio_distance = (torch.cdist(
+                distance_audio_embeddings, classes_embeddings, p=2)
+                if distance_audio_embeddings is not None else None)
+            video_distance = (torch.cdist(
+                distance_video_embeddings, classes_embeddings, p=2)
+                if distance_video_embeddings is not None else None)
+            if distance_fn == "SquaredL2Loss":
+                audio_distance = (audio_distance.pow(2)
+                                  if audio_distance is not None else None)
+                video_distance = (video_distance.pow(2)
+                                  if video_distance is not None else None)
+        else:
+            raise ValueError(f"Unknown evaluation mode: {mode}")
+
+        use_adaptive_fusion = (
+            mode == "both" and adaptive_modality_fusion and
+            not getattr(args, "cjme", False))
+        if use_adaptive_fusion:
+            if best_fusion_weight is None:
+                # Center-first ordering makes exact ties prefer the original
+                # equal fusion instead of an arbitrary single modality.
+                audio_weights = torch.tensor(
+                    [0.5, 0.4, 0.6, 0.3, 0.7, 0.2,
+                     0.8, 0.1, 0.9, 0.0, 1.0],
+                    dtype=torch.float, device=device)
             else:
-                distance_mat = torch.zeros((a_p.shape[0], len(dataset.all_class_ids)), dtype=torch.float,
-                                           device=device) + 99999999999999
-                distance_mat_zsl = torch.zeros((a_p.shape[0], len(dataset.all_class_ids)), dtype=torch.float,
-                                               device=device) + 99999999999999
+                audio_weights = torch.tensor(
+                    [best_fusion_weight], dtype=torch.float, device=device)
+        else:
+            audio_weights = torch.tensor([0.5], dtype=torch.float, device=device)
+
+        batch_size = v_p.shape[0] if a_p is None else a_p.shape[0]
+        for audio_weight in audio_weights:
             if mode == "audio":
-                distance_mat[:, seen_unseen_array] = torch.cdist(a_p, classes_embeddings)  # .pow(2)
-                mask = torch.zeros(len(dataset.all_class_ids), dtype=torch.long, device=device)
-                mask[seen_label_array] = 99999999999999
-                distance_mat_zsl = distance_mat + mask
-                if distance_fn == "SquaredL2Loss":
-                    distance_mat[:, seen_unseen_array] = distance_mat[:, seen_unseen_array].pow(2)
-                    distance_mat_zsl[:, unseen_label_array] = distance_mat_zsl[:, unseen_label_array].pow(2)
+                class_distance = audio_distance
             elif mode == "video":
-                distance_mat[:, seen_unseen_array] = torch.cdist(v_p, classes_embeddings)  # .pow(2)
-                mask = torch.zeros(len(dataset.all_class_ids), dtype=torch.long, device=device)
-                mask[seen_label_array] = 99999999999999
-                distance_mat_zsl = distance_mat + mask
-                if distance_fn == "SquaredL2Loss":
-                    distance_mat[:, seen_unseen_array] = distance_mat[:, seen_unseen_array].pow(2)
-                    distance_mat_zsl[:, unseen_label_array] = distance_mat_zsl[:, unseen_label_array].pow(2)
-            elif mode == "both":
-                # L2
-                audio_distance = torch.cdist(a_p, classes_embeddings, p=2)  # .pow(2)
-                video_distance = torch.cdist(v_p, classes_embeddings, p=2)  # .pow(2)
+                class_distance = video_distance
+            elif getattr(args, "cjme", False):
+                class_distance = ((1 - attention_weights) * audio_distance +
+                                  attention_weights * video_distance)
+            elif not adaptive_modality_fusion:
+                class_distance = audio_distance + video_distance
+            else:
+                class_distance = (audio_weight * audio_distance +
+                                  (1.0 - audio_weight) * video_distance)
 
-                if distance_fn == "SquaredL2Loss":
-                    audio_distance = audio_distance.pow(2)
-                    video_distance = video_distance.pow(2)
+            distance_mat = torch.full(
+                (batch_size, len(dataset.all_class_ids)), 99999999999999.0,
+                dtype=torch.float, device=device)
+            distance_mat[:, seen_unseen_array] = class_distance
+            zsl_mask = torch.zeros(
+                len(dataset.all_class_ids), dtype=torch.float, device=device)
+            zsl_mask[seen_label_array] = 99999999999999.0
+            distance_mat_zsl = distance_mat + zsl_mask
 
-                # Sum
-                if args.cjme==True:
-                    distance_mat[:, seen_unseen_array]=(1-attention_weights)*audio_distance+attention_weights*video_distance
+            for beta in betas:
+                mask = torch.full(
+                    (len(dataset.all_class_ids),), 0.0,
+                    dtype=torch.float, device=device)
+                if semantic_aware_calibration:
+                    mask[seen_label_array] = beta.item() * seen_penalty_scales
                 else:
-                    distance_mat[:, seen_unseen_array] = (audio_distance + video_distance)
+                    mask[seen_label_array] = beta.item()
+                neighbor_batch = torch.argmin(distance_mat + mask, dim=1)
+                match_idx = neighbor_batch.eq(targets.int()).nonzero().flatten()
+                match_counts = torch.bincount(
+                    neighbor_batch[match_idx], minlength=len(dataset.all_class_ids)
+                )[seen_unseen_array]
+                target_counts = torch.bincount(
+                    targets, minlength=len(dataset.all_class_ids)
+                )[seen_unseen_array]
+                per_class_recall = torch.zeros(
+                    len(dataset.all_class_ids), dtype=torch.float, device=device)
+                per_class_recall[seen_unseen_array] = match_counts / target_counts
+                seen_recall_dict = per_class_recall[seen_label_array]
+                unseen_recall_dict = per_class_recall[unseen_label_array]
+                s = seen_recall_dict.mean()
+                u = unseen_recall_dict.mean()
 
-                mask = torch.zeros(len(dataset.all_class_ids), dtype=torch.long, device=device)
-                mask[seen_label_array] = 99999999999999
-                distance_mat_zsl = distance_mat + mask
+                if save_performances:
+                    seen_dict = {k: v for k, v in zip(
+                        np.array(dataset.all_class_names)[seen_label_array.cpu().numpy()],
+                        seen_recall_dict.cpu().numpy())}
+                    unseen_dict = {k: v for k, v in zip(
+                        np.array(dataset.all_class_names)[unseen_label_array.cpu().numpy()],
+                        unseen_recall_dict.cpu().numpy())}
+                    save_class_performances(
+                        seen_dict, unseen_dict, dataset.dataset_name)
 
-            mask = torch.zeros(len(dataset.all_class_ids), dtype=torch.long, device=device) + beta
-            mask[unseen_label_array] = 0
-            neighbor_batch = torch.argmin(distance_mat + mask, dim=1)
-            match_idx = neighbor_batch.eq(targets.int()).nonzero().flatten()
-            match_counts = torch.bincount(neighbor_batch[match_idx], minlength=len(dataset.all_class_ids))[
-                seen_unseen_array]
-            target_counts = torch.bincount(targets, minlength=len(dataset.all_class_ids))[seen_unseen_array]
-            per_class_recall = torch.zeros(len(dataset.all_class_ids), dtype=torch.float, device=device)
-            per_class_recall[seen_unseen_array] = match_counts / target_counts
-            seen_recall_dict = per_class_recall[seen_label_array]
-            unseen_recall_dict = per_class_recall[unseen_label_array]
-            s = seen_recall_dict.mean()
-            u = unseen_recall_dict.mean()
+                hm = (2 * u * s) / ((u + s) + np.finfo(float).eps)
+                gzsl_per_class_recalls.append(per_class_recall.tolist())
+                neighbor_batch_zsl = torch.argmin(distance_mat_zsl, dim=1)
+                match_idx = neighbor_batch_zsl.eq(targets.int()).nonzero().flatten()
+                match_counts = torch.bincount(
+                    neighbor_batch_zsl[match_idx],
+                    minlength=len(dataset.all_class_ids))[seen_unseen_array]
+                per_class_recall = torch.zeros(
+                    len(dataset.all_class_ids), dtype=torch.float, device=device)
+                per_class_recall[seen_unseen_array] = match_counts / target_counts
+                zsl = per_class_recall[unseen_label_array].mean()
 
-            if save_performances:
-                seen_dict = {k: v for k, v in zip(np.array(dataset.all_class_names)[seen_label_array.cpu().numpy()], seen_recall_dict.cpu().numpy())}
-                unseen_dict = {k: v for k, v in zip(np.array(dataset.all_class_names)[unseen_label_array.cpu().numpy()], unseen_recall_dict.cpu().numpy())}
-                save_class_performances(seen_dict, unseen_dict, dataset.dataset_name)
-
-            hm = (2 * u * s) / ((u + s) + np.finfo(float).eps)
-
-            neighbor_batch_zsl = torch.argmin(distance_mat_zsl, dim=1)
-            match_idx = neighbor_batch_zsl.eq(targets.int()).nonzero().flatten()
-            match_counts = torch.bincount(neighbor_batch_zsl[match_idx], minlength=len(dataset.all_class_ids))[
-                seen_unseen_array]
-            target_counts = torch.bincount(targets, minlength=len(dataset.all_class_ids))[seen_unseen_array]
-            per_class_recall = torch.zeros(len(dataset.all_class_ids), dtype=torch.float, device=device)
-            per_class_recall[seen_unseen_array] = match_counts / target_counts
-            zsl = per_class_recall[unseen_label_array].mean()
-
-            zsl_scores.append(zsl.item())
-            seen_scores.append(s.item())
-            unseen_scores.append(u.item())
-            hm_scores.append(hm.item())
-            per_class_recalls.append(per_class_recall.tolist())
+                zsl_scores.append(zsl.item())
+                seen_scores.append(s.item())
+                unseen_scores.append(u.item())
+                hm_scores.append(hm.item())
+                per_class_recalls.append(per_class_recall.tolist())
+                candidate_betas.append(beta.item())
+                candidate_audio_weights.append(audio_weight.item())
         argmax_hm = np.argmax(hm_scores)
         max_seen = seen_scores[argmax_hm]
         max_zsl = zsl_scores[argmax_hm]
         max_unseen = unseen_scores[argmax_hm]
         max_hm = hm_scores[argmax_hm]
         max_recall = per_class_recalls[argmax_hm]
-        best_beta = betas[argmax_hm].item()
-    return {
+        max_gzsl_recall = gzsl_per_class_recalls[argmax_hm]
+        best_beta = candidate_betas[argmax_hm]
+        best_audio_weight = candidate_audio_weights[argmax_hm]
+    evaluation = {
         "seen": max_seen,
         "unseen": max_unseen,
         "hm": max_hm,
@@ -391,9 +539,151 @@ def get_best_evaluation(dataset, targets, a_p, v_p, t_p, mode, device, distance_
         "zsl": max_zsl,
         "beta": best_beta
     }
+    if semantic_aware_calibration:
+        evaluation["semantic_aware_calibration"] = True
+        evaluation["seen_penalty_scale_min"] = seen_penalty_scales.min().item()
+        evaluation["seen_penalty_scale_max"] = seen_penalty_scales.max().item()
+    # ``recall`` predates the diagnostics and is the ZSL per-class vector.
+    # Expose the GZSL vector separately so Seen/Unseen bias reports use the
+    # actual calibrated GZSL predictions.
+    evaluation["gzsl_recall"] = max_gzsl_recall
+    if mode == "both" and adaptive_modality_fusion and not getattr(args, "cjme", False):
+        evaluation["audio_weight"] = best_audio_weight
+    return evaluation
 
 
-def evaluate_dataset(dataset, model, device, distance_fn, best_beta=None, args=None):
+def get_energy_ood_evaluation(dataset, targets, a_p, v_p, t_p,
+                              distance_fn, threshold=None,
+                              score_normalization="raw",
+                              score_embeddings=None):
+    """Route samples to Seen/Unseen nearest-class experts using Seen energy."""
+    if a_p is None or v_p is None:
+        raise ValueError("Energy-OOD routing requires both audio and video embeddings")
+
+    device = a_p.device
+    all_label_array = torch.tensor(
+        np.sort(np.concatenate((dataset.seen_class_ids,
+                                dataset.unseen_class_ids))),
+        dtype=torch.long, device=device)
+    seen_ids = set(int(value) for value in dataset.seen_class_ids)
+    seen_positions = torch.tensor(
+        [index for index, value in enumerate(all_label_array.tolist())
+         if value in seen_ids], dtype=torch.long, device=device)
+    unseen_positions = torch.tensor(
+        [index for index, value in enumerate(all_label_array.tolist())
+         if value not in seen_ids], dtype=torch.long, device=device)
+    seen_label_array = all_label_array[seen_positions]
+    unseen_label_array = all_label_array[unseen_positions]
+
+    with torch.no_grad():
+        audio_distance = torch.cdist(a_p, t_p, p=2)
+        video_distance = torch.cdist(v_p, t_p, p=2)
+        if distance_fn == "SquaredL2Loss":
+            audio_distance = audio_distance.pow(2)
+            video_distance = video_distance.pow(2)
+        class_distance = audio_distance + video_distance
+        if score_embeddings is None:
+            score_class_distance = class_distance
+            score_source = "classification_model"
+        else:
+            score_a_p, score_v_p, score_t_p = score_embeddings
+            score_audio_distance = torch.cdist(score_a_p, score_t_p, p=2)
+            score_video_distance = torch.cdist(score_v_p, score_t_p, p=2)
+            if distance_fn == "SquaredL2Loss":
+                score_audio_distance = score_audio_distance.pow(2)
+                score_video_distance = score_video_distance.pow(2)
+            score_class_distance = score_audio_distance + score_video_distance
+            score_source = "stage_a_model"
+        if score_normalization == "zscore":
+            distance_mean = score_class_distance.mean(dim=1, keepdim=True)
+            distance_std = score_class_distance.std(
+                dim=1, keepdim=True, unbiased=False).clamp_min(1e-12)
+            energy_distance = (
+                score_class_distance - distance_mean) / distance_std
+        elif score_normalization == "raw":
+            energy_distance = score_class_distance
+        else:
+            raise ValueError(
+                f"Unknown Energy-OOD score normalization: {score_normalization}")
+        seen_distance = class_distance[:, seen_positions]
+        unseen_distance = class_distance[:, unseen_positions]
+        seen_energy_distance = energy_distance[:, seen_positions]
+
+        # A larger score means that the sample lies closer to the Seen-class
+        # embedding set. This is the energy-only part of EZ-AVOOD.
+        seen_energy = torch.logsumexp(-seen_energy_distance, dim=1)
+        seen_prediction = seen_label_array[torch.argmin(seen_distance, dim=1)]
+        unseen_prediction = unseen_label_array[
+            torch.argmin(unseen_distance, dim=1)]
+
+        total_classes = len(dataset.all_class_ids)
+        target_counts = torch.bincount(
+            targets.long(), minlength=total_classes).float()
+
+        def recall_for(predictions):
+            correct_targets = targets.long()[predictions.eq(targets.long())]
+            correct_counts = torch.bincount(
+                correct_targets, minlength=total_classes).float()
+            recalls = torch.zeros(total_classes, dtype=torch.float,
+                                  device=device)
+            present = target_counts > 0
+            recalls[present] = correct_counts[present] / target_counts[present]
+            return recalls
+
+        zsl_recall = recall_for(unseen_prediction)
+        zsl = zsl_recall[unseen_label_array].mean().item()
+
+        if threshold is None:
+            # Quantiles cap validation cost while covering both all-Seen and
+            # all-Unseen endpoints. Intermediate values are sufficient because
+            # routing changes only when a sample score is crossed.
+            n_quantiles = min(401, seen_energy.numel() + 1)
+            quantiles = torch.linspace(0, 1, n_quantiles, device=device)
+            candidates = torch.unique(torch.quantile(seen_energy, quantiles))
+            scale = max(float(seen_energy.abs().max().item()), 1.0)
+            margin = scale * 1e-6
+            candidates = torch.cat((
+                seen_energy.min().reshape(1) - margin,
+                candidates,
+                seen_energy.max().reshape(1) + margin,
+            ))
+        else:
+            candidates = torch.tensor(
+                [float(threshold)], dtype=seen_energy.dtype, device=device)
+
+        best = None
+        for candidate in candidates:
+            route_to_seen = seen_energy >= candidate
+            predictions = torch.where(
+                route_to_seen, seen_prediction, unseen_prediction)
+            gzsl_recall = recall_for(predictions)
+            seen = gzsl_recall[seen_label_array].mean().item()
+            unseen = gzsl_recall[unseen_label_array].mean().item()
+            hm = 2 * seen * unseen / (seen + unseen + np.finfo(float).eps)
+            result = {
+                "seen": seen,
+                "unseen": unseen,
+                "hm": hm,
+                "zsl": zsl,
+                "recall": zsl_recall.tolist(),
+                "gzsl_recall": gzsl_recall.tolist(),
+                "threshold": candidate.item(),
+                "routed_seen_rate": route_to_seen.float().mean().item(),
+                "score_normalization": score_normalization,
+                "score_source": score_source,
+            }
+            if best is None or result["hm"] > best["hm"]:
+                best = result
+
+    return best
+
+
+def evaluate_dataset(dataset, model, device, distance_fn, best_beta=None,
+                     args=None, best_fusion_weight=None,
+                     adaptive_modality_fusion=False,
+                     energy_ood_routing=False,
+                     best_energy_threshold=None,
+                     energy_ood_score="raw"):
     data = dataset.all_data
     data_a = data["audio"].to(device)
     data_v = data["video"].to(device)
@@ -420,12 +710,22 @@ def evaluate_dataset(dataset, model, device, distance_fn, best_beta=None, args=N
     video_evaluation = get_best_evaluation(dataset, all_targets, a_p, v_p, t_p, mode="video", device=device,
                                            distance_fn=distance_fn, best_beta=best_beta, args=args)
     both_evaluation = get_best_evaluation(dataset, all_targets, a_p, v_p, t_p, mode="both", device=device,
-                                          distance_fn=distance_fn, best_beta=best_beta, args=args, attention_weights=threshold_attention)
-    return {
+                                          distance_fn=distance_fn, best_beta=best_beta,
+                                          best_fusion_weight=best_fusion_weight,
+                                          adaptive_modality_fusion=adaptive_modality_fusion,
+                                          args=args, attention_weights=threshold_attention)
+    evaluation = {
         "audio": audio_evaluation,
         "video": video_evaluation,
         "both": both_evaluation
     }
+    if energy_ood_routing:
+        evaluation["energy_ood"] = get_energy_ood_evaluation(
+            dataset, all_targets, a_p, v_p, t_p,
+            distance_fn=distance_fn,
+            threshold=best_energy_threshold,
+            score_normalization=energy_ood_score)
+    return evaluation
 
 
 def get_class_names(path):

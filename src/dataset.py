@@ -9,7 +9,47 @@ import torch
 from torch.utils import data
 from tqdm import tqdm
 
+from src.class_embedding_optimization import load_or_optimize_class_embeddings
 from src.utils import read_features, get_class_names
+
+
+def _maybe_apply_ceo_text_embeddings(args, root, data, dataset, logger):
+    """Replace in-memory class text with a shared frozen CEO dictionary."""
+    if not getattr(args, "ceo_optimize_text", False):
+        return data
+    text = data.get("text", {})
+    embeddings = text.get("data")
+    if embeddings is None:
+        raise ValueError("CEO text optimization requires the full text dictionary")
+    # The raw files can include classes outside the GZSL benchmark (e.g. the
+    # remaining UCF101 labels). CEO must only optimize the benchmark dictionary.
+    class_ids = np.asarray(_ceo_task_class_ids(dataset), dtype=np.int64)
+    source = np.asarray(embeddings, dtype=np.float32)
+    selected = source[class_ids]
+    # Keep the source vectors for diagnostics; processed feature files remain untouched.
+    text["original_data"] = torch.as_tensor(source).clone()
+    optimized_selected = load_or_optimize_class_embeddings(
+        selected,
+        cache_dir=Path(root) / "_ceo_text_cache",
+        alpha=getattr(args, "ceo_alpha", 0.5),
+        margin=getattr(args, "ceo_margin", 1.0),
+        steps=getattr(args, "ceo_steps", 500),
+        lr=getattr(args, "ceo_lr", 0.05),
+        triplets=getattr(args, "ceo_triplets", 8192),
+        seed=getattr(args, "seed", 42),
+        logger=logger)
+    optimized = torch.as_tensor(source).clone()
+    optimized[class_ids] = torch.from_numpy(optimized_selected)
+    text["data"] = optimized
+    return data
+
+
+def _ceo_task_class_ids(dataset):
+    """Use the final GZSL task dictionary, not unused source-dataset labels."""
+    if hasattr(dataset, "test_seen_ids") and hasattr(dataset, "test_unseen_ids"):
+        return np.unique(np.concatenate((
+            dataset.test_seen_ids, dataset.test_unseen_ids)))
+    return dataset.all_class_ids
 
 
 class VGGSoundDataset(data.Dataset):
@@ -209,6 +249,8 @@ class VGGSoundDataset(data.Dataset):
 
         self.preprocess()
         self.data = self.get_data()
+        self.data = _maybe_apply_ceo_text_embeddings(
+            args, self.root, self.data, self, self.logger)
 
     def __getitem__(self, item):
         raise NotImplementedError()
@@ -444,6 +486,8 @@ class AudioSetZSLDataset(data.Dataset):
 
         self.preprocess()
         self.data = self.get_data()
+        self.data = _maybe_apply_ceo_text_embeddings(
+            args, self.root, self.data, self, self.logger)
 
     def __getitem__(self, index):
         target = self.targets[index]
@@ -593,17 +637,17 @@ class ContrastiveDataset(data.Dataset):
             f"Based on Dataset: {zsl_dataset.__class__.__name__}\t"
             f"with split: {zsl_dataset.dataset_split}")
         self.zsl_dataset = zsl_dataset
-        self.dataset_split = self.zsl_dataset.dataset_split
         self.classes = self.zsl_dataset.classes
+        dataset_split = self.zsl_dataset.dataset_split
 
-        if self.dataset_split == "train" or self.dataset_split == "train_val":
+        if dataset_split == "train" or dataset_split == "train_val":
             self.targets = self.zsl_dataset.targets
             self.data = self.zsl_dataset.all_data
             self.targets_set = set(self.targets.tolist())
             self.target_to_indices = {target: np.where(self.zsl_dataset.targets == target)[0]
                                       for target in self.targets_set}
 
-        elif self.dataset_split == "val" or self.dataset_split == "test":
+        elif dataset_split == "val" or dataset_split == "test":
             self.targets = self.zsl_dataset.targets
             self.data = self.zsl_dataset.all_data
             # generate fixed pairs for testing
@@ -624,14 +668,22 @@ class ContrastiveDataset(data.Dataset):
                              for i in range(len(self.targets))]
             self.val_pairs = pos_neg_pairs
         else:
-            raise AttributeError("Dataset_split has to be either train, val, train_val or test.")
+            raise AttributeError(
+                "Dataset_split has to be either train, val, train_val or test; "
+                f"got {dataset_split!r}.")
+
+    @property
+    def dataset_split(self):
+        """Use the wrapped dataset as the single source of split state."""
+        return self.zsl_dataset.dataset_split
 
     def __len__(self):
         classes_mask = np.where(np.isin(self.zsl_dataset.targets, self.classes))[0]
         return len(self.zsl_dataset.targets[classes_mask])
 
     def __getitem__(self, index):
-        if self.dataset_split == "train" or self.dataset_split == "train_val":
+        dataset_split = self.zsl_dataset.dataset_split
+        if dataset_split == "train" or dataset_split == "train_val":
             positive_target = self.targets[index].item()
             pos_target_index = list(self.targets_set).index(positive_target)
             x_a1 = self.data["audio"][index]
@@ -650,7 +702,7 @@ class ContrastiveDataset(data.Dataset):
             x_t2 = self.data["text"][neg_target_index]
             x_url2 = self.data["url"][negative_index]
             # x_numeric2=self.data["target"][negative_index].item()
-        elif self.dataset_split == "val" or self.dataset_split == "test":
+        elif dataset_split == "val" or dataset_split == "test":
             positive_target = self.targets[self.val_pairs[index][0]].item()
             pos_target_index = list(self.targets_set).index(positive_target)
             x_a1 = self.data["audio"][self.val_pairs[index][0]]
@@ -666,7 +718,9 @@ class ContrastiveDataset(data.Dataset):
             # x_numeric2=self.data["target"][self.val_pairs[index][1]].item()
             x_url2 = self.data["url"][self.val_pairs[index][1]]
         else:
-            raise AttributeError("Dataset_split has to be either train, val, train_val or test.")
+            raise AttributeError(
+                "Dataset_split has to be either train, val, train_val or test; "
+                f"got {dataset_split!r}.")
 
         data = {
             "positive": {"audio": x_a1, "video": x_v1, "text": x_t1, "url": x_url1},
@@ -877,6 +931,8 @@ class UCFDataset(data.Dataset):
 
         self.preprocess()
         self.data = self.get_data()
+        self.data = _maybe_apply_ceo_text_embeddings(
+            args, self.root, self.data, self, self.logger)
 
     def __getitem__(self, item):
         raise NotImplementedError()
@@ -1195,6 +1251,8 @@ class ActivityNetDataset(data.Dataset):
 
         self.preprocess()
         self.data = self.get_data()
+        self.data = _maybe_apply_ceo_text_embeddings(
+            args, self.root, self.data, self, self.logger)
 
     def __getitem__(self, item):
         raise NotImplementedError()

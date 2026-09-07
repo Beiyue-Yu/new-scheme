@@ -11,7 +11,8 @@ class SamplerFactory:
     def __init__(self, logger, verbose=0):
         self.logger = logger
 
-    def get(self, class_idxs, batch_size, n_batches, alpha, kind):
+    def get(self, class_idxs, batch_size, n_batches, alpha, kind,
+            target_class_distribution=None):
         """
         Parameters
         ----------
@@ -36,11 +37,46 @@ class SamplerFactory:
             The kind of sampler. `Fixed` will ensure each batch contains a constant proportion of
             samples from each class. `Random` will simply sample with replacement according to the
             calculated weights.
+
+        target_class_distribution : optional sequence of float
+            Explicit probability mass for every class. This bypasses ``alpha``
+            and is useful when classes belong to groups with deliberately
+            different total sampling mass.
         """
+        if target_class_distribution is not None:
+            return self._get_target_distribution(
+                class_idxs, batch_size, n_batches, kind,
+                target_class_distribution)
         if kind == 'random':
             return self.random(class_idxs, batch_size, n_batches, alpha)
         if kind == 'fixed':
             return self.fixed(class_idxs, batch_size, n_batches, alpha)
+        raise Exception(f'Received kind {kind}, must be `random` or `fixed`')
+
+    def _get_target_distribution(self, class_idxs, batch_size, n_batches,
+                                 kind, target_class_distribution):
+        class_sizes = np.asarray([len(idxs) for idxs in class_idxs])
+        distribution = np.asarray(target_class_distribution, dtype=np.float64)
+        if distribution.shape != class_sizes.shape:
+            raise ValueError(
+                "target_class_distribution must provide one weight per class")
+        if (not np.isfinite(distribution).all() or (distribution < 0).any() or
+                distribution.sum() <= 0.0):
+            raise ValueError(
+                "target_class_distribution must be finite, non-negative, and non-empty")
+        if (class_sizes <= 0).any():
+            raise ValueError("Every sampled class must contain at least one item")
+        distribution = distribution / distribution.sum()
+        self.logger.info("Creating sampler with explicit target class distribution...")
+        self.logger.info("Sample population absolute class sizes: %s", class_sizes)
+        self.logger.info("Target batch class distribution %s", distribution)
+        if kind == 'random':
+            return WeightedRandomBatchSampler(
+                distribution / class_sizes, class_idxs, batch_size, n_batches)
+        if kind == 'fixed':
+            return WeightedFixedBatchSampler(
+                self._fix_batches(distribution, class_sizes, batch_size, n_batches),
+                class_idxs, n_batches)
         raise Exception(f'Received kind {kind}, must be `random` or `fixed`')
 
     def random(self, class_idxs, batch_size, n_batches, alpha):

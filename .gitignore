@@ -149,8 +149,28 @@ activemq-data/
 
 #Ignore this file
 avgzsl_benchmark_datasets
+raw_datasets/
+model_cache/
 runs
 run_scripts
+!run_scripts/
+run_scripts/*
+!run_scripts/run_mstr_two_stage.sh
+!run_scripts/ActivityNet-GZSL/
+run_scripts/ActivityNet-GZSL/*
+!run_scripts/ActivityNet-GZSL/mstr_baseline_full.sh
+!run_scripts/ActivityNet-GZSL/stft_ablation_full.sh
+!run_scripts/UCF-GZSL/
+run_scripts/UCF-GZSL/*
+!run_scripts/UCF-GZSL/mstr_baseline_full.sh
+!run_scripts/UCF-GZSL/stft_ablation_full.sh
+!run_scripts/UCF-GZSL/class_conditioned_evidence_pilot.sh
+!run_scripts/UCF-GZSL/languagebind_temporal_pilot.sh
+!run_scripts/UCF-GZSL/languagebind_official_val.sh
+!run_scripts/VGGSound-GZSL/
+run_scripts/VGGSound-GZSL/*
+!run_scripts/VGGSound-GZSL/mstr_baseline_full.sh
+!run_scripts/VGGSound-GZSL/stft_ablation_full.sh
 cls_feature_extration
 selavi_feature_extraction
 
